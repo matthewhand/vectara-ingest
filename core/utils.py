@@ -36,14 +36,39 @@ doc_extensions = [".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".pdf", ".p
 archive_extensions = [".zip", ".gz", ".tar", ".bz2", ".7z", ".rar"]
 binary_extensions = archive_extensions + img_extensions + doc_extensions
 
-def setup_logging():
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    root.addHandler(handler)
+def setup_logging(level='INFO', use_basic_config=True):
+    """
+    Set up logging configuration.
+
+    Args:
+        level (str): Logging level as a string (e.g., 'DEBUG', 'INFO', 'WARNING', 'ERROR').
+        use_basic_config (bool): If True, use logging.basicConfig(). If False, use manual handler setup.
+    """
+    numeric_level = getattr(logging, level.upper(), None)
+    if not isinstance(numeric_level, int):
+        print(f"Invalid log level: {level}. Defaulting to INFO.")
+        numeric_level = logging.INFO
+
+    if use_basic_config:
+        # Use logging.basicConfig() for simpler setup
+        logging.basicConfig(
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            level=numeric_level,
+            handlers=[logging.StreamHandler()]
+        )
+    else:
+        # Manual handler setup for more control
+        root = logging.getLogger()
+        root.setLevel(numeric_level)
+
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(numeric_level)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+
+        # Avoid duplicate handlers
+        if not root.handlers:
+            root.addHandler(handler)
 
 def url_to_filename(url):
     parsed_url = urlparse(url)
