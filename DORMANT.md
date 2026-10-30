@@ -1,47 +1,47 @@
-# vectara-ingest — DORMANT (July 2026)
+# vectara-ingest — dormant deployment note
 
-## Why dormant
-Vectara retired its v1 REST API in August 2025. This project uses v1 endpoints exclusively, and the customer account (`customer_id: <customer_id>`) has been purged. The cron job has been failing silently since at least July 2026.
+## Status and history
 
-## What this project does
-Crawls RSS feeds (configured in `config/pg-rss.yaml`), processes articles through an AI pipeline, and indexes them into a Vectara corpus for semantic search.
+This fork was previously described as dormant in July 2026, after the legacy
+Vectara v1 integration and associated account/scheduled job reportedly stopped
+working. The historical account and cron-job status have **not** been rechecked.
+This note does not establish whether a deployment is currently running.
 
-## What was working
-- RSS feed crawling pipeline (postgres sources, discourse, etc.)
-- Document parsing via `unstructured.io`
-- JWT-based auth against Vectara v1 API
-- Dockerized execution via `run.sh`
+**The repository code has since changed.** The upstream changes incorporated
+into this fork in October 2026 include Vectara **v2 API** endpoints. The
+checked-in implementation is therefore not v1-only; remaining compatibility
+work, if any, still requires integration testing.
 
-## What needs doing to revive
+## Current code (source-inspected, not live-tested)
 
-### 1. Vectara account
-- Sign up at https://console.vectara.com/signup (30-day free trial)
-- Create a new corpus, get: `api_key`, `customer_id`, `corpus_key`
+- `core/indexer.py` uses v2 document upload, indexing and deletion endpoints,
+  including `/v2/corpora/{corpus_key}/documents` and
+  `/v2/corpora/{corpus_key}/documents/{encoded_doc_id}` (the document ID is
+  URL-encoded before use).
+- `ingest.py` implements v2 corpus creation at `/v2/corpora` and resetting at
+  `/v2/corpora/{corpus_key}/reset`.
+- Vectara API-key authentication is used by the indexer; corpus creation/reset
+  also have OAuth client-credential paths.
+- The repository includes RSS/feed crawling, document parsing and `run.sh`
+  orchestration. `run.sh` is already executable in the fork's `main` branch.
 
-### 2. v1 → v2 API migration (required)
-The v1 API is retired. Code changes needed in `core/indexer.py` and `ingest.py`:
+These are source-code observations, **not** evidence of a successful v2 API
+request, working credentials, a running deployment or compatible live data.
 
-| v1 (current) | v2 (needed) |
-|---|---|
-| `/v1/index` | `/v2/corpora/{corpus_key}/documents` |
-| `/v1/delete-doc` | `/v2/corpora/{corpus_key}/documents/{doc_id}` |
-| `/v1/reset-corpus` | `/v2/corpora/{corpus_key}/documents?delete=true` |
-| JWT OAuth2 auth | `x-api-key` header (simpler!) |
-| `customer_id` header | Not needed for v2 (except password auth) |
-| `corpus_id: 1` (int) | `corpus_key` (string) |
-| `num_results`, `start` | `limit`, `offset` |
+## Before reviving or scheduling
 
-### 3. Update configs
-- `secrets.toml`: new `api_key`
-- `config/pg-rss.yaml`: new `customer_id` + `corpus_key`
+1. Confirm whether any installation, container, job or cron schedule is active;
+   do not re-enable an old task without checking its current owner and target.
+2. Obtain a valid Vectara account, permitted credentials and a **test** corpus.
+   Reconcile local configuration and secret names with the current source; never
+   commit credentials or assume historical customer IDs remain usable.
+3. Resolve outstanding security advisories separately. At the upstream sync,
+   `authlib==1.6.11` was below the 1.9.0 fix for a critical advisory.
+4. Run dependency-resolution and bounded local tests, then separately authorised
+   end-to-end checks against the test corpus. Check any remaining API and auth
+   incompatibilities before claiming a working migration.
+5. Only after explicit deployment approval, review the current `run.sh`,
+   container settings and scheduling configuration before enabling operation.
 
-### 4. Re-enable
-```bash
-chmod +x run.sh  # Already done
-# Uncomment the cron entry in crontab
-```
-
-## Files
-- Repo: https://github.com/matthewhand/vectara-ingest
-- Cron was: `0 0,12 * * * cd ~/vectara-ingest && bash -l -c './run.sh'` (disabled July 2026)
-- Config: `config/pg-rss.yaml`, `secrets.toml`
+No deployment, live endpoint check or scheduler change was performed as part of
+this documentation update.
