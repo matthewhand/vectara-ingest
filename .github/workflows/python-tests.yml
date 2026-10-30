@@ -1,0 +1,41 @@
+name: Run Python Unit Tests
+
+on:
+  pull_request: # Triggers on pull requests to any branch by default when 'branches' is omitted
+  # Also run on main. Without this the suite only ever ran pre-merge, so a merged
+  # PR could leave main red and nobody would see it until the next PR opened —
+  # which is exactly how the stale PMC URL assertion went unnoticed.
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"] # From your Dockerfile
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: |
+          uv pip install --system -r requirements.txt
+          uv pip install --system -r requirements-extra.txt
+          uv pip install --system -r requirements-test.txt
+
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s tests -p "test_*.py"
+          # If your tests are not in a 'tests' directory or have a different pattern,
+          # adjust the command above. For example, if tests are at the root:
+          # python -m unittest discover -p "test_*.py"

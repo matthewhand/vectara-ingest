@@ -1,149 +1,817 @@
-import logging
-import os
-from core.crawler import Crawler, recursive_crawl
-from core.utils import clean_urls, archive_extensions, img_extensions, get_file_extension, RateLimiter, setup_logging, get_urls_from_sitemap
-from core.indexer import Indexer
 import re
-from typing import List, Set
+import requests
+import logging
+import psutil
+import os
+
+from core.crawler import Crawler
+from core.crawl_tracker import CrawlShutdownException
+from core.utils import (
+    clean_urls, archive_extensions, img_extensions, get_file_extension, RateLimiter, 
+    setup_logging, get_docker_or_local_path, url_matches_patterns, normalize_vectara_endpoint
+)
+from core.indexer import Indexer
+from core.indexer_utils import normalize_url_for_metadata
+from core.incremental import build_manifest, plan_deletions, prefilter_unchanged
+from core.spider import run_link_spider_isolated, recursive_crawl, sitemap_to_urls, sitemap_to_urls_with_meta
+from crawlers.auth.saml_manager import SAMLAuthManager
+from crawlers.auth.google_manager import GoogleAuthManager
 
 import ray
-import psutil
+
+logger = logging.getLogger(__name__)
+
+
+def _pick_google_target_url(cfg) -> str | None:
+    """Pick the URL the Google auth manager should navigate to for establishing
+    the session. Returns the first configured crawl URL when available so the
+    auth-establishing navigation lands on a Workspace-scoped path (which routes
+    to the correct Google account); otherwise returns None and the manager
+    falls back to bare sites.google.com.
+    """
+    try:
+        urls = cfg.website_crawler.urls
+    except AttributeError:
+        return None
+    if not urls:
+        return None
+    first = urls[0]
+    return first if isinstance(first, str) and first else None
+
+
+def _transfer_session_to_context(context, session):
+    """Forward cookies from a `requests.Session` to a Playwright context."""
+    if not session or not hasattr(session, 'cookies'):
+        return
+    for cookie in session.cookies:
+        attrs = {
+            'name': cookie.name,
+            'value': cookie.value,
+            'domain': cookie.domain or '',
+            'path': cookie.path or '/',
+        }
+        if getattr(cookie, 'secure', False):
+            attrs['secure'] = True
+        if getattr(cookie, 'expires', None):
+            attrs['expires'] = cookie.expires
+        try:
+            context.add_cookies([attrs])
+        except Exception as e:
+            logger.warning(f"Failed to add cookie {cookie.name} to Playwright context: {e}")
+
+
+def _apply_auth_to_indexer(
+    indexer,
+    saml_session=None,
+    google_cookies=None,
+    google_storage_state_path=None,
+):
+    """Propagate auth to an Indexer so both `session` (requests) and
+    `web_extractor` (Playwright) issue authenticated fetches.
+
+    Used by `WebsiteCrawler._configure_indexer_session` (parent process,
+    discovery-side indexer) and by `PageCrawlWorker.setup` (per-worker
+    indexer in Ray actor or single-process mode).
+
+    For Google auth, the Playwright context is loaded from the captured
+    `storage_state` JSON. Re-injecting individual cookies via `add_cookies`
+    fails for Google's `__Host-*` / `__Secure-*` cookies (CDP rejects the
+    batch because `__Host-` cookies must be sent without a Domain attribute
+    and `__Secure-` cookies require `Secure=true`). Playwright's
+    `storage_state` path preserves the original cookie attributes verbatim.
+    """
+    if saml_session and hasattr(indexer, 'session'):
+        indexer.session = saml_session
+        logger.info("Configured indexer to use SAML authenticated session")
+
+    if google_cookies and hasattr(indexer, 'session') and indexer.session is not None:
+        # Use create_cookie + set_cookie so each cookie retains its
+        # domain/path/secure scoping in the requests cookie jar. A flat
+        # `cookies.update({name: value})` would attach every Google cookie
+        # to every host the session talks to, leaking host-bound cookies
+        # (`__Host-*`) to wrong domains on redirects.
+        for c in google_cookies:
+            cookie = requests.cookies.create_cookie(
+                name=c["name"],
+                value=c["value"],
+                domain=c.get("domain", ""),
+                path=c.get("path", "/"),
+                secure=bool(c.get("secure", False)),
+            )
+            indexer.session.cookies.set_cookie(cookie)
+        logger.info(
+            f"Merged {len(google_cookies)} Google session cookies into indexer session"
+        )
+
+    if not (saml_session or google_storage_state_path):
+        return
+
+    indexer._init_processors()
+    if hasattr(indexer, 'web_extractor') and indexer.web_extractor:
+        original_new_context = indexer.web_extractor.browser.new_context
+
+        def new_context_with_auth(*args, **kwargs):
+            if google_storage_state_path:
+                kwargs.setdefault('storage_state', google_storage_state_path)
+            context = original_new_context(*args, **kwargs)
+            if saml_session:
+                _transfer_session_to_context(context, saml_session)
+            return context
+
+        indexer.web_extractor.browser.new_context = new_context_with_auth
+        # Auth is wired in via Playwright `storage_state` / per-context cookie
+        # transfer. Tell the extractor to skip the unauthenticated `requests.get`
+        # prefetch in `fetch_page_contents` — without this, the prefetch follows
+        # redirects to the IdP sign-in page (~1KB of HTML, >500 chars) and
+        # short-circuits the authenticated browser path entirely.
+        indexer.web_extractor.skip_static_prefetch = True
+        logger.info("Configured web extractor to inject authenticated cookies")
 
 
 class PageCrawlWorker(object):
-    def __init__(self, indexer: Indexer, crawler: Crawler, num_per_second: int):
-        self.crawler = crawler
-        self.indexer = indexer
+    def __init__(self, cfg: dict, num_per_second: int, prior_fingerprints: dict = None,
+                 sitemap_lastmods: dict = None):
+        self.cfg = cfg
         self.rate_limiter = RateLimiter(num_per_second)
+        self.indexer = None
+        self.session = None
+        # {normalized_url: fingerprint} from the prior corpus state. Lets index_url skip an
+        # unchanged page. Passed by the dispatcher (via ray.put for Ray actors).
+        self.prior_fingerprints = prior_fingerprints or {}
+        # {normalized_url: sitemap <lastmod>} for the CURRENT crawl, stamped into each doc so
+        # the next run can compare sitemap-lastmod against sitemap-lastmod (not against the
+        # HTML-derived last_updated, which is a different clock).
+        self.sitemap_lastmods = sitemap_lastmods or {}
+        website_crawler_cfg = self.cfg.get('website_crawler', {})
+        self.html_processing = website_crawler_cfg.get('html_processing', {})
+        self.saml_config = website_crawler_cfg.get('saml_auth')
+        self.google_config = website_crawler_cfg.get('google_auth')
+        self.scrape_method = website_crawler_cfg.get('scrape_method', 'playwright')
 
     def setup(self):
-        self.indexer.setup()
+        """
+        Initializes the worker's resources (Indexer, Session) within the Ray process.
+        This method MUST be called before `process`.
+        """
         setup_logging()
+    
+        vectara_cfg = self.cfg.get('vectara', {})
+        api_url = normalize_vectara_endpoint(vectara_cfg.get('endpoint'))
+        corpus_key = vectara_cfg['corpus_key']
+        api_key = vectara_cfg['api_key']
+        
+        self.indexer = Indexer(self.cfg, api_url, corpus_key, api_key, scrape_method=self.scrape_method)
+        self.indexer.setup()
 
-    def process(self, url: str, extraction: str, source: str):
+        # Initialize SAML session if configured
+        if self.saml_config:
+            worker_pid = os.getpid()
+            logging.info(f"[Worker {worker_pid}] SAML authentication is enabled. Initializing SAMLAuthManager.")
+            
+            # Extract SAML secrets from the config (they should be loaded by ingest.py)
+            saml_secrets = {}
+            website_crawler_cfg = self.cfg.get('website_crawler', {})
+            if 'saml_username' in website_crawler_cfg and 'saml_password' in website_crawler_cfg:
+                saml_secrets['username'] = website_crawler_cfg['saml_username']
+                saml_secrets['password'] = website_crawler_cfg['saml_password']
+            else:
+                raise ValueError("SAML authentication requires 'SAML_USERNAME' and 'SAML_PASSWORD' in secrets.toml")
+            
+            try:
+                auth_manager = SAMLAuthManager(config=self.saml_config, secrets=saml_secrets)
+                self.session = auth_manager.get_authenticated_session()
+                logging.info(f"[Worker {worker_pid}] SAML authentication successful.")
+
+                # Wire SAML into both requests.Session and Playwright web_extractor
+                # via the shared helper. A bare `indexer.session = self.session`
+                # would leave `skip_static_prefetch` off, so the unauthenticated
+                # static prefetch in `WebContentExtractor.fetch_page_contents`
+                # would follow redirects to the IdP and short-circuit the
+                # authenticated browser path before it ran.
+                _apply_auth_to_indexer(self.indexer, saml_session=self.session)
+                logging.info(
+                    f"[Worker {worker_pid}] SAML session wired into indexer (requests + Playwright)."
+                )
+
+            except Exception as e:
+                logging.error(f"[Worker {worker_pid}] Fatal SAML authentication failure: {e}")
+                raise
+        else:
+            logging.info(f"[Worker {os.getpid()}] SAML not configured. Using standard session.")
+            # Indexer will use its default session
+
+        # Initialize Google authenticated cookies if configured (independent of SAML).
+        # A Bearer-token API session is NOT useful here: sites.google.com content
+        # URLs reject Bearer auth (only browser cookies work). We capture cookies
+        # from the persisted storage_state and inject them into both the indexer's
+        # requests.Session and its Playwright web_extractor.
+        if self.google_config:
+            worker_pid = os.getpid()
+            logging.info(f"[Worker {worker_pid}] Google authentication enabled. Capturing storage_state cookies.")
+
+            google_secrets = {}
+            website_crawler_cfg = self.cfg.get('website_crawler', {})
+            if 'google_credentials_file' in website_crawler_cfg:
+                google_secrets['credentials_file'] = website_crawler_cfg['google_credentials_file']
+
+            try:
+                google_manager = GoogleAuthManager(config=self.google_config, secrets=google_secrets)
+                # Use the actual configured crawl URL to establish session cookies.
+                # Workspace-scoped paths (sites.google.com/<domain>/<site>) route
+                # directly to the right Google account; bare sites.google.com can
+                # bounce to the multi-account chooser on Firefox-imported sessions.
+                google_target = _pick_google_target_url(self.cfg)
+                google_cookies = google_manager.get_authenticated_cookies(target_url=google_target)
+                _apply_auth_to_indexer(
+                    self.indexer,
+                    google_cookies=google_cookies,
+                    google_storage_state_path=google_manager.storage_state_path,
+                )
+                logging.info(
+                    f"[Worker {worker_pid}] Captured {len(google_cookies)} Google session cookies."
+                )
+            except Exception as e:
+                logging.error(f"[Worker {worker_pid}] Fatal Google authentication failure: {e}")
+                raise
+    
+    def cleanup(self):
+        """Cleanup resources when worker is done"""
+        if hasattr(self, 'indexer'):
+            self.indexer.cleanup()
+
+    # Return codes from process(). PageCrawlWorker runs in a Ray actor, so
+    # the dispatch side can't read `self.indexer.last_skip_reason` directly —
+    # we encode the outcome in the integer return value instead.
+    RESULT_INDEXED = 0
+    RESULT_FAILED = 1
+    RESULT_AUTH_REQUIRED = 2
+    RESULT_SKIPPED = 3
+
+    def process(self, url: str, source: str):
+        if not self.indexer:
+            logging.error(f"[Worker {os.getpid()}] Indexer not set up. Call setup() before process().")
+            return self.RESULT_FAILED
+
+        nu = normalize_url_for_metadata(url)
         metadata = {"source": source, "url": url}
-        if extraction == "pdf":
-            try:
-                with self.rate_limiter:
-                    filename = self.crawler.url_to_file(url, title="")
-            except Exception as e:
-                logging.error(f"Error while processing {url}: {e}")
-                return -1
-            try:
-                succeeded = self.indexer.index_file(filename, uri=url, metadata=metadata)
-                if not succeeded:
-                    logging.info(f"Indexing failed for {url}")
-                else:
-                    if os.path.exists(filename):
-                        os.remove(filename)
-                    logging.info(f"Indexing {url} was successful")
-            except Exception as e:
-                import traceback
-                logging.error(
-                    f"Error while indexing {url}: {e}, traceback={traceback.format_exc()}"
-                )
-                return -1
-        else:  # use index_url which uses PlayWright
-            logging.info(f"Crawling and indexing {url}")
-            try:
-                with self.rate_limiter:
-                    succeeded = self.indexer.index_url(url, metadata=metadata, html_processing=self.crawler.html_processing)
-                if not succeeded:
-                    logging.info(f"Indexing failed for {url}")
-                else:
-                    logging.info(f"Indexing {url} was successful")
-            except Exception as e:
-                import traceback
-                logging.error(
-                    f"Error while indexing {url}: {e}, traceback={traceback.format_exc()}"
-                )
-                return -1
-        return 0
+        # Record the sitemap lastmod (if any) so next run's Layer-1 compares like-for-like.
+        sm_lastmod = self.sitemap_lastmods.get(nu)
+        if sm_lastmod:
+            metadata["sitemap_lastmod"] = sm_lastmod
+        prior_fingerprint = self.prior_fingerprints.get(nu)
+        logging.info(f"[Worker {os.getpid()}] Crawling and indexing {url}")
+        succeeded = False
+        try:
+            with self.rate_limiter:
+                succeeded = self.indexer.index_url(
+                    url, metadata=metadata, html_processing=self.html_processing,
+                    prior_fingerprint=prior_fingerprint)
+            if not succeeded:
+                logging.info(f"[Worker {os.getpid()}] Indexing failed for {url}")
+            else:
+                logging.info(f"[Worker {os.getpid()}] Indexing {url} was successful")
+        except Exception as e:
+            import traceback
+            logging.error(
+                f"[Worker {os.getpid()}] Error while indexing {url}: {e}, traceback={traceback.format_exc()}"
+            )
+            return self.RESULT_FAILED
+        # An "unchanged" skip returns True (success) but should be counted separately
+        # from a freshly indexed page so the corpus is not needlessly churned.
+        if self.indexer.was_skipped():
+            return self.RESULT_SKIPPED
+        if succeeded:
+            return self.RESULT_INDEXED
+        if getattr(self.indexer, "last_skip_reason", None):
+            return self.RESULT_AUTH_REQUIRED
+        return self.RESULT_FAILED
 
 class WebsiteCrawler(Crawler):
+    def __init__(self, cfg, *args, **kwargs):
+        super().__init__(cfg, *args, **kwargs)
+        self.saml_session = None
+        self.google_cookies = None
+        self.google_storage_state_path = None
+        # Incremental reindexing state (see core/incremental.py).
+        self.incremental = self.cfg.website_crawler.get("incremental", False)
+        self.source = self.cfg.website_crawler.get("source", "website")
+        self._sitemap_lastmod = {}   # normalized_url -> sitemap <lastmod> (sitemap mode only)
+        self._manifest = None        # corpus manifest, built once when needed
+        self._crawl_interrupted = False
+        self._setup_saml_auth()
+        self._setup_google_auth()
+
+    def _setup_saml_auth(self):
+        """Initialize SAML authentication if configured"""
+        saml_config = self.cfg.website_crawler.get("saml_auth")
+        if not saml_config:
+            return
+
+        logger.info("SAML authentication configured, initializing...")
+
+        try:
+            secrets_dict = self._get_saml_secrets()
+            saml_manager = SAMLAuthManager(saml_config, secrets_dict)
+            self.saml_session = saml_manager.get_authenticated_session()
+            logger.info("SAML authentication successful")
+
+        except Exception as e:
+            logger.error(f"SAML authentication failed: {e}")
+            raise
+
+    def _get_saml_secrets(self):
+        """Extract SAML secrets from config (loaded from secrets.toml)."""
+        if hasattr(self.cfg.website_crawler, 'saml_username') and hasattr(self.cfg.website_crawler, 'saml_password'):
+            return {
+                'username': self.cfg.website_crawler.saml_username,
+                'password': self.cfg.website_crawler.saml_password
+            }
+        raise ValueError("SAML authentication requires 'SAML_USERNAME' and 'SAML_PASSWORD' in secrets.toml")
+
+    def _setup_google_auth(self):
+        """Capture `sites.google.com` session cookies once at crawler init.
+
+        These cookies are the only thing that authenticates requests against
+        `sites.google.com` content URLs — Bearer tokens are rejected there.
+        They are injected into both the indexer's `requests.Session` and its
+        Playwright `web_extractor` by `_configure_indexer_session`, and also
+        forwarded to Scrapy in the discovery path via `_discover_urls`.
+
+        `GOOGLE_CREDENTIALS_FILE` is optional here: it is only consumed when
+        someone calls `GoogleAuthManager.get_authenticated_session()` for
+        Drive / Sites API access. Cookie-only crawls do not need it.
+        """
+        google_config = self.cfg.website_crawler.get("google_auth")
+        if not google_config:
+            return
+
+        logger.info("Google authentication configured, capturing storage_state cookies...")
+        secrets_dict = {}
+        if hasattr(self.cfg.website_crawler, 'google_credentials_file'):
+            secrets_dict['credentials_file'] = self.cfg.website_crawler.google_credentials_file
+
+        try:
+            google_manager = GoogleAuthManager(google_config, secrets_dict)
+            target = _pick_google_target_url(self.cfg)
+            self.google_cookies = google_manager.get_authenticated_cookies(target_url=target)
+            self.google_storage_state_path = google_manager.storage_state_path
+            logger.info(
+                f"Captured {len(self.google_cookies)} Google session cookies."
+            )
+        except Exception as e:
+            logger.error(f"Google authentication failed: {e}")
+            raise
+
+    def _get_scrapy_saml_cookies(self):
+        """
+        Get SAML authentication cookies using SAMLAuthManager's Playwright method.
+        Returns a list of `{name, value}` dicts in the shape Scrapy expects.
+        Domain/secure attributes are absent because SAMLAuthManager flattens
+        cookies at capture time — Scrapy will treat them as host-bound to
+        each request URL, which is correct for single-IdP SAML flows.
+        """
+        saml_config = self.cfg.website_crawler.get("saml_auth")
+        if not saml_config:
+            return None
+
+        try:
+            secrets_dict = self._get_saml_secrets()
+            saml_manager = SAMLAuthManager(saml_config, secrets_dict)
+            flat = saml_manager.get_authenticated_cookies()
+            if not flat:
+                return None
+            return [{"name": k, "value": v} for k, v in flat.items()]
+
+        except Exception as e:
+            logger.error(f"Failed to get SAML cookies: {e}")
+            return None
+
     def crawl(self) -> None:
+        """Main crawl orchestration method."""
+        # 1. Configuration and setup
+        self._configure_indexer_session()
+        
+        # 2. Discover all URLs using the chosen method
+        all_urls = self._discover_urls()
+
+        # 3. Filter and prepare the final URL list
+        urls_to_crawl = self._filter_and_prepare_urls(all_urls)
+
+        # An empty discovery is treated as an interrupted/failed crawl so the deletion guard
+        # never mass-deletes the corpus when discovery silently produced nothing.
+        if not urls_to_crawl:
+            self._crawl_interrupted = True
+
+        # 4. Dispatch the jobs to workers (Ray or single process)
+        try:
+            self._dispatch_crawl_jobs(urls_to_crawl)
+        except CrawlShutdownException:
+            # A graceful shutdown means we did not finish the crawl — do not let the deletion
+            # pass run against a partial present-set.
+            self._crawl_interrupted = True
+            raise
+
+        # 5. Handle post-crawl cleanup
+        self._remove_old_content_if_needed(urls_to_crawl)
+
+    def _configure_indexer_session(self):
+        """Propagate SAML session and/or Google cookies to the indexer's
+        `requests.Session` and Playwright `web_extractor`."""
+        _apply_auth_to_indexer(
+            self.indexer,
+            saml_session=self.saml_session,
+            google_cookies=self.google_cookies,
+            google_storage_state_path=self.google_storage_state_path,
+        )
+
+    def _discover_urls(self) -> list:
+        """
+        Discover URLs using the chosen crawl method.
+        Returns list of discovered URLs.
+        """
         base_urls = self.cfg.website_crawler.urls
-        self.pos_regex = [re.compile(r) for r in self.cfg.website_crawler.get("pos_regex", [])]
-        self.neg_regex = [re.compile(r) for r in self.cfg.website_crawler.get("neg_regex", [])]
+        self.pos_regex = self.cfg.website_crawler.get("pos_regex", [])
+        self.pos_patterns = [re.compile(r) for r in self.pos_regex]
+        self.neg_regex = self.cfg.website_crawler.get("neg_regex", [])
+        self.neg_patterns = [re.compile(r) for r in self.neg_regex]
         keep_query_params = self.cfg.website_crawler.get('keep_query_params', False)
         self.html_processing = self.cfg.website_crawler.get('html_processing', {})
+        max_depth = self.cfg.website_crawler.get("max_depth", 3)
 
-        # grab all URLs to crawl from all base_urls
+        # Determine crawl method and handle SAML / Google auth for Scrapy.
+        # Cookies are passed as a list of dicts (`{name, value, domain, path,
+        # secure}`) so Scrapy's CookieMiddleware can enforce per-cookie
+        # scoping on redirects — `__Host-*` and other host-bound Google
+        # cookies must not leak to `sites.google.com` from `accounts.google.com`.
+        crawl_method = self.cfg.website_crawler.get("crawl_method", "internal")
+        scrapy_cookies: list = []
+
+        if crawl_method == "scrapy" and self.cfg.website_crawler.get("saml_auth"):
+            logger.info("SAML detected with Scrapy - attempting Playwright-based SAML authentication")
+            saml_cookies = self._get_scrapy_saml_cookies()
+            if saml_cookies:
+                scrapy_cookies.extend(saml_cookies)
+                logger.info(f"Playwright-based SAML successful! Got {len(saml_cookies)} cookies")
+            else:
+                logger.warning(
+                    "Playwright-based SAML failed. Falling back to internal crawler with requests-based SAML."
+                )
+                crawl_method = "internal"
+
+        if crawl_method == "scrapy" and self.cfg.website_crawler.get("google_auth"):
+            logger.info("Google auth detected with Scrapy - forwarding captured session cookies")
+            if self.google_cookies:
+                scrapy_cookies.extend(self.google_cookies)
+                logger.info(f"Loaded {len(self.google_cookies)} Google session cookies")
+            else:
+                # Google cookies are required to crawl sites.google.com. Without
+                # them, every Scrapy request 302s into accounts.google.com and we
+                # discover 0 URLs. Surface this loudly rather than silently
+                # producing an empty crawl.
+                raise RuntimeError(
+                    "Google authentication is configured but no session cookies were obtained. "
+                    "Run `python -m crawlers.auth.google_bootstrap --output <path>` to capture a Google session."
+                )
+
+        # Pass None instead of an empty list so the spider keeps default
+        # behavior for crawls that have no auth configured.
+        scrapy_cookies = scrapy_cookies or None
+        
+        # Execute crawling based on method
+        if crawl_method == "scrapy":
+            return self._discover_urls_with_scrapy(base_urls, max_depth, scrapy_cookies)
+        else:
+            return self._discover_urls_with_internal_crawler(base_urls, max_depth, keep_query_params)
+
+    def _discover_urls_with_scrapy(self, base_urls: list, max_depth: int, scrapy_cookies: list) -> list:
+        """Discover URLs using Scrapy crawler."""
+        logger.info("Using Scrapy to crawl the website")
+        
+        # Prepare extra settings for Scrapy with cookies
+        extra_settings = {}
+        if scrapy_cookies:
+            extra_settings.update({
+                'COOKIES_ENABLED': True,
+                'COOKIES_DEBUG': True
+            })
+            logger.info("Configuring Scrapy with SAML cookies")
+        
+        return run_link_spider_isolated(
+            start_urls=base_urls,
+            positive_regexes=self.pos_regex,
+            negative_regexes=self.neg_regex,
+            max_depth=max_depth,
+            extra_settings=extra_settings,
+            cookies=scrapy_cookies
+        )
+
+    def _discover_urls_with_internal_crawler(self, base_urls: list, max_depth: int, keep_query_params: bool) -> list:
+        """Discover URLs using internal Vectara-ingest crawler."""
+        logger.info("Using internal Vectara-ingest method to crawl the website")
         all_urls = []
+        pages_source = self.cfg.website_crawler.get("pages_source", "crawl")
+        
         for homepage in base_urls:
-            if self.cfg.website_crawler.pages_source == "sitemap":
-                urls = get_urls_from_sitemap(homepage)
-            elif self.cfg.website_crawler.pages_source == "crawl":
-                max_depth = self.cfg.website_crawler.get("max_depth", 3)
-                urls_set = recursive_crawl(homepage, max_depth, 
-                                           pos_regex=self.pos_regex, neg_regex=self.neg_regex, 
-                                           indexer=self.indexer, visited=set(), verbose=self.indexer.verbose)
+            urls = []
+            
+            # Get URLs based on pages_source method
+            if pages_source == "sitemap":
+                # `indexer.session` carries both SAML and Google cookies after
+                # `_configure_indexer_session` has run, so sitemap fetches work
+                # against authenticated origins regardless of which auth is set.
+                if self.incremental:
+                    # Capture <lastmod> alongside each URL so the dispatcher can skip
+                    # pages that have not changed since the last index — without fetching them.
+                    pairs = sitemap_to_urls_with_meta(homepage, session=self.indexer.session)
+                    urls = []
+                    for url, lastmod in pairs:
+                        if url.startswith('http') and url_matches_patterns(url, self.pos_patterns, self.neg_patterns):
+                            urls.append(url)
+                            if lastmod:
+                                self._sitemap_lastmod[normalize_url_for_metadata(url)] = lastmod
+                else:
+                    urls = sitemap_to_urls(homepage, session=self.indexer.session)
+                    urls = [
+                        url for url in urls
+                        if url.startswith('http') and url_matches_patterns(url, self.pos_patterns, self.neg_patterns)
+                    ]
+            elif pages_source == "crawl":
+                urls_set = recursive_crawl(
+                    homepage, max_depth,
+                    pos_patterns=self.pos_patterns, neg_patterns=self.neg_patterns,
+                    indexer=self.indexer, visited=set(), verbose=self.indexer.verbose
+                )
                 urls = clean_urls(urls_set, keep_query_params)
             else:
-                logging.info(f"Unknown pages_source: {self.cfg.website_crawler.pages_source}")
-                return
-            logging.info(f"Found {len(urls)} URLs on {homepage}")
-            all_urls += urls
+                logger.info(f"Unknown pages_source: {pages_source}")
+                continue
+            
+            logger.info(f"Found {len(urls)} URLs on {homepage}")
+            all_urls.extend(urls)
+            
+        return all_urls
 
-        # remove URLS that are out of our regex regime or are archives or images
-        urls = [u for u in all_urls if u.startswith('http') and not any([u.endswith(ext) for ext in archive_extensions + img_extensions])]
-        if self.pos_regex and len(self.pos_regex)>0:
-            urls = [u for u in all_urls if any([r.match(u) for r in self.pos_regex])]
-        if self.neg_regex and len(self.neg_regex)>0:
-            urls = [u for u in all_urls if not any([r.match(u) for r in self.neg_regex])]
-        urls = list(set(urls))
+    def _filter_and_prepare_urls(self, all_urls: list) -> list:
+        """
+        Filter URLs by extensions and patterns, deduplicate, and generate crawl report.
+        Returns the final list of URLs to crawl.
+        """
+        # Filter and deduplicate URLs
+        excluded_extensions = archive_extensions + img_extensions
+        urls = [
+            url for url in all_urls
+            if (url.startswith('http') and
+                not any(url.lower().endswith(ext) for ext in excluded_extensions) and
+                url_matches_patterns(url, self.pos_patterns, self.neg_patterns))
+        ]
+        # Deduplicate on the normalized URL — the same form used for doc ids
+        # and remove_old_content comparisons — so encoding variants of one
+        # page are crawled once. Keep the first-seen original URL for fetching.
+        unique_urls = {}
+        for url in urls:
+            unique_urls.setdefault(normalize_url_for_metadata(url), url)
+        urls = list(unique_urls.values())
 
         # Store URLS in crawl_report if needed
         if self.cfg.website_crawler.get("crawl_report", False):
-            logging.info(f"Collected {len(urls)} URLs to crawl and index. See urls_indexed.txt for a full report.")
-            with open('/home/vectara/env/urls_indexed.txt', 'w') as f:
+            logger.info(f"Collected {len(urls)} URLs to crawl and index. See urls_indexed.txt for a full report.")
+            output_dir = self.cfg.vectara.get("output_dir", "vectara_ingest_output")
+            docker_path = f'/home/vectara/{output_dir}/urls_indexed.txt'
+            filename = os.path.basename(docker_path)  # Extract just the filename
+            file_path = get_docker_or_local_path(
+                docker_path=docker_path,
+                output_dir=output_dir
+            )
+
+            if not file_path.endswith(filename):
+                file_path = os.path.join(file_path, filename)
+
+            with open(file_path, 'w') as f:
                 for url in sorted(urls):
                     f.write(url + '\n')
         else:
-            logging.info(f"Collected {len(urls)} URLs to crawl and index.")
+            logger.info(f"Collected {len(urls)} URLs to crawl and index.")
 
-        # print some file types
+        # Print some file types
         file_types = list(set([get_file_extension(u) for u in urls]))
         file_types = [t for t in file_types if t != ""]
-        logging.info(f"Note: file types = {file_types}")
+        logger.info(f"Note: file types = {file_types}")
+        
+        return urls
+
+    def _ensure_manifest(self):
+        """Build the corpus manifest once (when incremental skipping or deletion needs it).
+        Source-scoped in incremental mode so a shared corpus is not cross-deleted; left
+        unscoped for legacy remove_old_content to preserve its behavior."""
+        if self._manifest is not None:
+            return
+        need = self.incremental or self.cfg.website_crawler.get("remove_old_content", False)
+        if not need:
+            return
+        source = self.indexer.source_tag if self.incremental else None
+        self._manifest = build_manifest(self.indexer, key="url", source=source)
+        logger.info(f"Loaded corpus manifest: {len(self._manifest)} existing documents")
+
+    def _lastmod_prefilter(self, urls: list) -> list:
+        """Drop URLs whose sitemap <lastmod> is not newer than the sitemap <lastmod> we stored
+        at the previous index — without fetching them. Comparing the stored sitemap lastmod
+        (not the HTML-derived last_updated, a different clock) keeps this sound, and the skip
+        is gated on the stored config_sig so a processing-config change re-indexes pages whose
+        lastmod is unchanged. Skipped URLs are still 'present' for deletion (they exist at
+        source)."""
+        if not self._sitemap_lastmod or not self._manifest:
+            return urls
+        kept, skipped = [], 0
+        for u in urls:
+            nu = normalize_url_for_metadata(u)
+            entry = self._manifest.get(nu)
+            lastmod = self._sitemap_lastmod.get(nu)
+            if lastmod and prefilter_unchanged(entry, lastmod, "sitemap_lastmod",
+                                               self.indexer.config_sig):
+                skipped += 1
+                if self.tracker:
+                    # Track under the raw URL — the same doc_id the worker path uses
+                    # (track_indexed/skipped(url, ...)). Using the normalized form here would
+                    # create a second, never-matching tracker entry for resume/stats.
+                    self.tracker.track_skipped(u, url=u)
+            else:
+                kept.append(u)
+        if skipped:
+            logger.info(f"Incremental: skipped {skipped} unchanged URLs via sitemap lastmod "
+                        f"({len(kept)} remaining to crawl)")
+        return kept
+
+    def _dispatch_crawl_jobs(self, urls: list):
+        """
+        Dispatch crawl jobs to Ray workers or process sequentially.
+        """
+        self._ensure_manifest()
+
+        if self.incremental and self._manifest is not None:
+            # Layer 1: skip unchanged pages before fetching, using sitemap <lastmod>.
+            urls = self._lastmod_prefilter(urls)
+            # Layer 2: give workers the prior fingerprint so index_url can skip an
+            # unchanged page after fetching (and before the upload / LLM work).
+            prior_fingerprints = {k: e.fingerprint for k, e in self._manifest.items() if e.fingerprint}
+        else:
+            prior_fingerprints = {}
+            # Legacy blind crash-recovery pre-filter — suppressed under incremental, where the
+            # manifest + fingerprint decide (so a changed page is not wrongly skipped).
+            if self.tracker and not self.cfg.vectara.get("reindex", False):
+                indexed = self.tracker.get_indexed_ids()
+                before = len(urls)
+                urls = [u for u in urls if u not in indexed]
+                logger.info(f"Skipping {before - len(urls)} already-indexed URLs ({len(urls)} remaining)")
 
         num_per_second = max(self.cfg.website_crawler.get("num_per_second", 10), 1)
-        extraction = self.cfg.website_crawler.get("extraction", "playwright")   # "playwright" or "pdf"
         ray_workers = self.cfg.website_crawler.get("ray_workers", 0)            # -1: use ray with ALL cores, 0: dont use ray
-        source = self.cfg.website_crawler.get("source", "website")
+        source = self.source
 
         if ray_workers == -1:
             ray_workers = psutil.cpu_count(logical=True)
 
+        sitemap_lastmods = self._sitemap_lastmod if self.incremental else {}
         if ray_workers > 0:
-            logging.info(f"Using {ray_workers} ray workers")
-            self.indexer.p = self.indexer.browser = None
-            ray.init(num_cpus=ray_workers, log_to_driver=True, include_dashboard=False)
-            actors = [ray.remote(PageCrawlWorker).remote(self.indexer, self, num_per_second) for _ in range(ray_workers)]
-            for a in actors:
-                a.setup.remote()
-            pool = ray.util.ActorPool(actors)
-            _ = list(pool.map(lambda a, u: a.process.remote(u, extraction=extraction, source=source), urls))
-                
+            self._dispatch_to_ray_workers(urls, ray_workers, num_per_second, source,
+                                          prior_fingerprints, sitemap_lastmods)
         else:
-            crawl_worker = PageCrawlWorker(self.indexer, self, num_per_second)
-            for inx, url in enumerate(urls):
-                if inx % 100 == 0:
-                    logging.info(f"Crawling URL number {inx+1} out of {len(urls)}")
-                crawl_worker.process(url, extraction=extraction, source=source)
+            self._dispatch_to_single_process(urls, num_per_second, source,
+                                             prior_fingerprints, sitemap_lastmods)
 
-        # If remove_old_content is set to true:
-        # remove from corpus any document previously indexed that is NOT in the crawl list
-        if self.cfg.website_crawler.get("remove_old_content", False):
-            existing_docs = self.indexer._list_docs()
-            docs_to_remove = [t for t in existing_docs if t['url'] and t['url'] not in urls]
-            for doc in docs_to_remove:
-                if doc['url']:
-                    self.indexer.delete_doc(doc['doc_id'])
-            logging.info(f"Removing {len(docs_to_remove)} docs that are not included in the crawl but are in the corpus.")
-            if self.cfg.website_crawler.get("crawl_report", False):
-                with open('/home/vectara/env/urls_removed.txt', 'w') as f:
-                    for url in sorted([t['url'] for t in docs_to_remove if t['url']]):
-                        f.write(url + '\n')
+    def _track_result(self, url: str, result: int):
+        """Record a worker outcome to the crawl tracker (no-op if tracking disabled)."""
+        if not self.tracker:
+            return
+        if result == PageCrawlWorker.RESULT_INDEXED:
+            self.tracker.track_indexed(url, url=url)
+        elif result == PageCrawlWorker.RESULT_SKIPPED:
+            self.tracker.track_skipped(url, url=url)
+        elif result == PageCrawlWorker.RESULT_AUTH_REQUIRED:
+            self.tracker.track_auth_required(url, url=url)
+        else:
+            self.tracker.track_failed(url, url=url)
 
+    def _dispatch_to_ray_workers(self, urls: list, ray_workers: int, num_per_second: int, source: str,
+                                 prior_fingerprints: dict = None, sitemap_lastmods: dict = None):
+        """Dispatch jobs to Ray workers for parallel processing."""
+        logger.info(f"Using {ray_workers} ray workers")
+        # Stop Playwright from URL discovery to close its asyncio event loop
+        # This allows workers to create fresh Playwright instances without conflicts
+        if hasattr(self.indexer, 'web_extractor') and self.indexer.web_extractor:
+            if hasattr(self.indexer.web_extractor, 'p') and self.indexer.web_extractor.p:
+                try:
+                    self.indexer.web_extractor.p.stop()
+                    logger.info("Stopped Playwright from URL discovery phase")
+                except Exception as e:
+                    logger.warning(f"Failed to stop Playwright: {e}")
+        self.indexer.web_extractor = None
+        ray.init(num_cpus=ray_workers, log_to_driver=True, include_dashboard=False)
+        try:
+            # Broadcast the per-url maps once via the object store (zero-copied per node, not
+            # duplicated per actor). Ray dereferences the ObjectRef into the dict in each actor.
+            pf_ref = ray.put(prior_fingerprints or {})
+            lm_ref = ray.put(sitemap_lastmods or {})
 
+            # Create workers with serializable config
+            actors = [ray.remote(PageCrawlWorker).remote(
+                self.cfg,
+                num_per_second,
+                pf_ref,
+                lm_ref
+            ) for _ in range(ray_workers)]
+            ray.get([a.setup.remote() for a in actors])
+            pool = ray.util.ActorPool(actors)
+            batch_size = max(ray_workers * 4, 20)
+            for batch_start in range(0, len(urls), batch_size):
+                self.check_shutdown()
+                batch = urls[batch_start:batch_start + batch_size]
+                results = list(pool.map(lambda a, u: a.process.remote(u, source=source), batch))
+                for url, result in zip(batch, results):
+                    self._track_result(url, result)
+                logger.info(f"Processed {min(batch_start + batch_size, len(urls))}/{len(urls)} URLs")
+            # Cleanup Ray workers
+            for a in actors:
+                ray.get(a.cleanup.remote())
+        finally:
+            # Always release Ray, even if check_shutdown() or a worker task raised mid-crawl —
+            # otherwise the cluster and its worker processes leak into subsequent runs.
+            ray.shutdown()
+
+    def _dispatch_to_single_process(self, urls: list, num_per_second: int, source: str,
+                                    prior_fingerprints: dict = None, sitemap_lastmods: dict = None):
+        """Process URLs sequentially in a single process."""
+        # Stop Playwright from URL discovery to close its asyncio event loop
+        # This allows worker to create fresh Playwright instance without conflicts
+        if hasattr(self.indexer, 'web_extractor') and self.indexer.web_extractor:
+            if hasattr(self.indexer.web_extractor, 'p') and self.indexer.web_extractor.p:
+                try:
+                    self.indexer.web_extractor.p.stop()
+                    logger.info("Stopped Playwright from URL discovery phase")
+                except Exception as e:
+                    logger.warning(f"Failed to stop Playwright: {e}")
+        self.indexer.web_extractor = None
+
+        crawl_worker = PageCrawlWorker(
+            self.cfg,
+            num_per_second,
+            prior_fingerprints,
+            sitemap_lastmods
+        )
+        crawl_worker.setup()
+        for inx, url in enumerate(urls):
+            self.check_shutdown()
+            if inx % 100 == 0:
+                logger.info(f"Crawling URL number {inx+1} out of {len(urls)}")
+            result = crawl_worker.process(url, source=source)
+            self._track_result(url, result)
+        # Cleanup worker
+        crawl_worker.cleanup()
+
+    def _remove_old_content_if_needed(self, crawled_urls: list):
+        """
+        Remove old content from corpus if remove_old_content is enabled.
+
+        Deletes any corpus document whose URL is not in the (full, discovered) crawl set —
+        guarded by plan_deletions against a partial/interrupted crawl mass-deleting live docs.
+        `crawled_urls` is the full discovered set (before any incremental skipping); lastmod/
+        fingerprint-skipped pages are still present at the source, hence still "present".
+        """
+        if not self.cfg.website_crawler.get("remove_old_content", False):
+            return
+
+        self._ensure_manifest()
+        manifest = self._manifest or {}
+        # Normalize: the indexer stores metadata['url'] URL-decoded, but crawled_urls may
+        # still be percent-encoded. build_manifest already keys on the normalized URL.
+        present_keys = {normalize_url_for_metadata(u) for u in crawled_urls if u}
+        listing_complete = (not self._crawl_interrupted) and len(present_keys) > 0
+        ratio = self.cfg.website_crawler.get("deletion_safety_ratio", 0.5)
+
+        to_delete, refused = plan_deletions(manifest, present_keys, listing_complete, ratio)
+        if refused:
+            return
+
+        removed_urls = []
+        to_delete_set = set(to_delete)
+        for entry in manifest.values():
+            if entry.doc_id in to_delete_set:
+                if self.indexer.delete_doc(entry.doc_id) and entry.url:
+                    removed_urls.append(entry.url)
+        logger.info(f"Removed {len(removed_urls)} of {len(to_delete)} docs that are not "
+                    f"included in the crawl but are in the corpus.")
+
+        if self.cfg.website_crawler.get("crawl_report", False):
+            output_dir = self.cfg.vectara.get("output_dir", "vectara_ingest_output")
+            docker_path = f'/home/vectara/{output_dir}/urls_removed.txt'
+            filename = os.path.basename(docker_path)  # Extract just the filename
+            file_path = get_docker_or_local_path(
+                docker_path=docker_path,
+                output_dir=output_dir
+            )
+
+            if not file_path.endswith(filename):
+                file_path = os.path.join(file_path, filename)
+
+            with open(file_path, 'w') as f:
+                for url in sorted(removed_urls):
+                    f.write(url + '\n')

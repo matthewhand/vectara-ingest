@@ -1,265 +1,365 @@
 import logging
+logger = logging.getLogger(__name__)
 import json
-import os
-from typing import Tuple, Dict, Any, List, Optional
-import uuid
-import pandas as pd
-import shutil
-
 import time
-import unicodedata
+import warnings
+import base64
+import hashlib
+from typing import Dict, Any, List, Optional, Sequence, Tuple
+from collections import OrderedDict
+import shutil
+import mimetypes
+
+import uuid
+import urllib.parse
+import tempfile
+import os
+
+import requests
+
 from slugify import slugify
 
 from omegaconf import OmegaConf
-from nbconvert import HTMLExporter      # type: ignore
+from nbconvert import HTMLExporter  # type: ignore
 import nbformat
 import markdown
+import whisper
 
+
+from core.summary import get_attributes_from_text
+from core.models import get_api_key
 from core.utils import (
-    html_to_text, detect_language, get_file_size_in_MB, create_session_with_retries, 
-    TableSummarizer, mask_pii, safe_remove_file, detect_file_type,
-    url_to_filename
+    html_to_text, detect_language, create_session_with_retries,
+    safe_remove_file, url_to_filename,
+    get_file_path_from_url, configure_session_for_ssl, get_docker_or_local_path,
+    get_headers, normalize_text, normalize_value, IMG_EXTENSIONS, release_memory
 )
 from core.extract import get_article_content
+from core.doc_parser import UnstructuredDocumentParser
+from core.image_processor import ImageProcessor
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-get_headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:98.0) Gecko/20100101 Firefox/98.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive",
-}
+from core.indexer_utils import (
+    get_chunking_config, extract_last_modified, create_upload_files_dict,
+    safe_file_cleanup, prepare_file_metadata, store_file,
+    normalize_url_for_metadata, auth_redirect_reason, md5_hex,
+    parse_conflict_doc_id
+)
+from core.incremental import (
+    compute_fingerprint, config_signature, content_hash_from_text, source_tag_for,
+)
+from core.web_extractor_base import create_web_extractor
+from core.file_processor import FileProcessor
+from core.document_builder import MAX_SECTION_CHARS, MAX_PART_SIZE
 
-def parse_local_file(filename: str, uri: str, summarize_tables: bool = False, openai_api_key: str = None) -> Tuple[str, List[str]]:
-    import unstructured as us
-    from unstructured.partition.pdf import partition_pdf
-    from unstructured.partition.html import partition_html
+# Suppress FutureWarning related to torch.load
+warnings.filterwarnings("ignore", category=FutureWarning, module="whisper")
+warnings.filterwarnings("ignore", category=UserWarning, message="FP16 is not supported on CPU; using FP32 instead")
 
-    import nltk
-    nltk.download('punkt_tab')
-    nltk.download('averaged_perceptron_tagger_eng')
 
-    logger = logging.getLogger()
-    st = time.time()
-    mime_type = detect_file_type(filename)
-    if mime_type == 'application/pdf':
-        if summarize_tables and openai_api_key is not None:
-                elements = partition_pdf(filename=filename, infer_table_structure=True, extract_images_in_pdf=False,
-                                        strategy='hi_res', hi_res_model_name='yolox')  # use 'detectron2_onnx' for a faster model
-        else:
-            elements = partition_pdf(filename, strategy='fast')
-    elif mime_type == 'text/html':
-        elements = partition_html(filename=filename)
-    else:
-        logger.info(f"data from {uri} is not HTML or PDF (mime type = {mime_type}), skipping")
-        return '', []
+def _document_has_oversized_part(document: Dict[str, Any]) -> bool:
+    """True if any structured section text or bundled table exceeds MAX_SECTION_CHARS.
 
-    titles = [str(x) for x in elements if type(x)==us.documents.elements.Title and len(str(x))>10]
-    title = titles[0] if len(titles)>0 else 'no title'
+    split_oversized only changes the document when such a part exists, so this is the
+    precise condition under which retrying a 400 with split_oversized=True can help.
+    Other 400s (e.g. an unrecognized field) have no oversized part and must fail loudly
+    rather than be silently retried into a degraded, incomplete document.
+    """
+    for section in document.get('sections', []):
+        if len(section.get('text', '')) > MAX_SECTION_CHARS:
+            return True
+        for table in section.get('tables', []):
+            if len(json.dumps(table.get('data', {}))) > MAX_SECTION_CHARS:
+                return True
+    return False
 
-    # get texts (and tables summaries if applicable)
-    summarizer = TableSummarizer(openai_api_key) if openai_api_key is not None and summarize_tables else None
-    texts = []
-    for t in elements:
-        if (type(t)==us.documents.elements.Table and 
-            summarize_tables and openai_api_key is not None):
-            texts.append(summarizer.summarize_table_text(str(t)))
-        else:
-            texts.append(str(t))
-    logger.info(f"parsing file {filename} with unstructured.io took {time.time()-st:.2f} seconds")
-    return title, texts
 
-class Indexer(object):
+class Indexer:
     """
     Vectara API class.
     Args:
-        endpoint (str): Endpoint for the Vectara API.
-        customer_id (str): ID of the Vectara customer.
-        corpus_id (int): ID of the Vectara corpus to index to.
+        api_url (str): Url for the Vectara API.
+        corpus_key (str): Key of the Vectara corpus to index to.
         api_key (str): API key for the Vectara API.
     """
-    def __init__(self, cfg: OmegaConf, endpoint: str, 
-                 customer_id: str, corpus_id: int, api_key: str) -> None:
+
+    def __init__(self, cfg: OmegaConf, api_url: str,
+                 corpus_key: str, api_key: str, scrape_method: str = None) -> None:
         self.cfg = cfg
-        self.browser_use_limit = 100
-        self.endpoint = endpoint
-        self.customer_id = customer_id
-        self.corpus_id = corpus_id
+        self.api_url = api_url
+        self.corpus_key = corpus_key
         self.api_key = api_key
         self.reindex = cfg.vectara.get("reindex", False)
+        self.create_corpus = cfg.vectara.get("create_corpus", False)
         self.verbose = cfg.vectara.get("verbose", False)
         self.store_docs = cfg.vectara.get("store_docs", False)
+        self.output_dir = cfg.vectara.get("output_dir", "vectara_ingest_output")
         self.remove_code = cfg.vectara.get("remove_code", True)
         self.remove_boilerplate = cfg.vectara.get("remove_boilerplate", False)
         self.post_load_timeout = cfg.vectara.get("post_load_timeout", 5)
         self.timeout = cfg.vectara.get("timeout", 90)
         self.detected_language: Optional[str] = None
+        self._last_response_status: Optional[int] = None
+        # Diagnostic: most recent failure reason from index_file(). Reset at the
+        # start of every index_file() call. Callers can read this after a False
+        # return to enrich their drop/error records.
+        self.last_error: Optional[str] = None
+        # When index_url skips a page because it was redirected to an IdP /
+        # sign-in form, this holds the reason string. Reset on every
+        # index_url call so callers can read it after a False return.
+        self.last_skip_reason: Optional[str] = None
         self.x_source = f'vectara-ingest-{self.cfg.crawling.crawler_type}'
-        self.logger = logging.getLogger()
+        self.scrape_method = scrape_method  # Store scrape_method for web extractor
 
-        self.summarize_tables = cfg.vectara.get("summarize_tables", False)
-        if cfg.vectara.get("openai_api_key", None) is None:
-            if self.summarize_tables:
-                self.logger.info("OpenAI API key not found, disabling table summarization")
-            self.summarize_tables = False
+        # Incremental reindexing. When enabled (per-crawler `incremental: true`), index_url /
+        # index_file stamp a content+metadata+config fingerprint into doc metadata and skip
+        # uploads whose fingerprint is unchanged. Gated so non-incremental users see no
+        # metadata change at all. `source_tag` scopes a doc to its crawler so a shared corpus
+        # is not cross-deleted; `config_sig` invalidates skips when processing config changes.
+        self.crawler_type = self.cfg.crawling.get("crawler_type", "")
+        _crawler_cfg = self.cfg.get(f"{self.crawler_type}_crawler", {}) or {}
+        self.incremental = bool(_crawler_cfg.get("incremental", False))
+        self.source_tag = source_tag_for(self.crawler_type, _crawler_cfg)
+        self.config_sig = config_signature(self.cfg)
+        if self.incremental and self.reindex:
+            logger.info("vectara.reindex is redundant under incremental mode (changed "
+                        "documents are replaced automatically); you can remove it.")
+        self.whisper_model = None
+        self.whisper_model_name = cfg.vectara.get("whisper_model", "base")
+        self.static_metadata = cfg.get('metadata', None)
+
+        if 'doc_processing' not in cfg:
+            cfg.doc_processing = {}
+        self.parse_tables = cfg.doc_processing.get("parse_tables", False)
+        self.enable_gmft = cfg.doc_processing.get("enable_gmft", False)
+        self.do_ocr = cfg.doc_processing.get("do_ocr", False)
+        self.summarize_images = cfg.doc_processing.get("summarize_images", False)
+        self.add_image_bytes = cfg.doc_processing.get("add_image_bytes", False)
+        self.process_locally = cfg.doc_processing.get("process_locally", False)
+        self.doc_parser = cfg.doc_processing.get("doc_parser", "docling")
+        self.use_core_indexing = cfg.doc_processing.get("use_core_indexing", False)
+        self.unstructured_config = cfg.doc_processing.get("unstructured_config",
+                                                          {'chunking_strategy': 'by_title', 'chunk_size': 1024})
+        self.docling_config = cfg.doc_processing.get("docling_config", {'chunking_strategy': 'none'})
+        self.extract_metadata = cfg.doc_processing.get("extract_metadata", [])
+        self.contextual_chunking = cfg.doc_processing.get("contextual_chunking", False)
+        self.image_context = cfg.doc_processing.get("image_context", {'num_previous_chunks': 1, 'num_next_chunks': 1})
+
+        # add_image_bytes attaches binary image data, which only *core* documents
+        # support (the images/document_parts fields are core-only; the structured
+        # API rejects them). Core parts are indexed as-is with no server-side
+        # chunking, so without a parser chunker the whole document would become one
+        # oversized part. Default docling chunking to 'hierarchical' (structure-based,
+        # needs no tokenizer model — safe for air-gapped deployments — and already the
+        # DoclingDocumentParser default) so parts are well-sized. This also trips
+        # _is_chunking_enabled() below, which forces use_core_indexing on. Only applied
+        # when chunking is off; an explicit chunking_strategy is never overridden, and
+        # unrelated docling keys (image_scale, layout_model, ...) are preserved.
+        if (self.add_image_bytes and self.doc_parser == "docling"
+                and self.docling_config.get("chunking_strategy", "none") == "none"):
+            self.docling_config = {
+                **self.docling_config,
+                "chunking_strategy": "hierarchical",
+                "chunk_size": self.docling_config.get("chunk_size", 1024),
+            }
+            OmegaConf.update(cfg, "doc_processing.docling_config", self.docling_config, merge=True)
+            logger.info(
+                "add_image_bytes is enabled: defaulting docling_config.chunking_strategy to "
+                "'hierarchical' so image-bearing documents are indexed via core with well-sized parts.")
+
+        # Auto-enable core indexing when chunking is detected
+        if self._is_chunking_enabled():
+            if not self.use_core_indexing:
+                logger.info("Chunking detected - automatically enabling use_core_indexing")
+                self.use_core_indexing = True
+
+        self.model_config = self._setup_model_config()
+        self._validate_model_dependencies()
+
+        logger.info(f"Vectara API Url = '{self.api_url}'")
+
+        # Initialize specialized processors (lazy loading)
+        self.web_extractor = None
+        self.file_processor = None
+        
+        # Performance optimizations
+        self._doc_exists_cache = OrderedDict()  # LRU cache for document existence checks
+        self._max_cache_size = 1000  # Prevent memory leaks on large corpora
 
         self.setup()
+    
+    def _is_chunking_enabled(self) -> bool:
+        """Check if chunking is enabled in any parser configuration"""
+        # Check unstructured chunking
+        is_unstructured_chunking = (
+            self.doc_parser in ["unstructured", None] and 
+            self.unstructured_config.get('chunking_strategy', 'by_title') != 'none'
+        )
+        
+        # Check docling chunking
+        is_docling_chunking = (
+            self.doc_parser == "docling" and 
+            self.docling_config.get('chunking_strategy', 'none') != 'none'
+        )
+        
+        # Contextual chunking is also a form of chunking
+        return is_unstructured_chunking or is_docling_chunking or self.contextual_chunking
+
+    def _init_processors(self):
+        """Lazy initialization of specialized processors"""
+        if self.web_extractor is None:
+            self.web_extractor = create_web_extractor(
+                cfg=self.cfg,
+                scrape_method=self.scrape_method,
+                timeout=self.timeout,
+                post_load_timeout=self.post_load_timeout
+            )
+        
+        if self.file_processor is None:
+            self.file_processor = FileProcessor(
+                cfg=self.cfg,
+                model_config=self.model_config
+            )
+        
+
+    def _setup_model_config(self):
+        """Setup model configuration with backward compatibility"""
+        if ('model' in self.cfg.doc_processing or
+            ('model_config' not in self.cfg.doc_processing and 'model' not in self.cfg.doc_processing)):
+            logger.warning(
+                "doc_processing.model will no longer be supported in a future release. Use doc_processing.model_config instead.")
+
+            provider = self.cfg.doc_processing.get("model", "openai")
+            pcfg = {
+                'provider': provider,
+                'model_name': self.cfg.doc_processing.get("model_name", "gpt-4o"),
+                'base_url': self.cfg.doc_processing.get("base_url",
+                                                        "https://api.openai.com/v1") if provider == 'openai' else \
+                    self.cfg.doc_processing.get("base_url", "https://api.anthropic.com/"),
+            }
+            mcfg = {
+                'text': pcfg,
+                'vision': pcfg,
+            }  # By default use the same model for text and image processing
+            OmegaConf.update(self.cfg, "doc_processing.model_config", mcfg, merge=False)
+
+        return self.cfg.doc_processing.get("model_config", {})
+    
+    def _validate_model_dependencies(self):
+        """Validate model dependencies and disable features if needed"""
+        text_api_key = get_api_key(self.model_config.get('text', {}).get('provider', None), self.cfg)
+        vision_api_key = get_api_key(self.model_config.get('vision', {}).get('provider', None), self.cfg)
+
+        if self.parse_tables and text_api_key is None and self.process_locally:
+            self.parse_tables = False
+            logger.warning("Table summarization enabled but model API key not found, disabling table summarization")
+
+        if self.summarize_images and vision_api_key is None:
+            self.summarize_images = False
+            logger.warning(
+                "Image summarization (doc_processing.summarize_images) enabled but model API key not found, disabling image summarization")
+
+        if self.contextual_chunking and text_api_key is None:
+            self.contextual_chunking = False
+            logger.warning("Contextual chunking enabled but model API key not found, disabling contextual chunking")
+
+        if self.extract_metadata and text_api_key is None:
+            self.extract_metadata = []
+            logger.warning(
+                "Metadata extraction (doc_processing.extract_metadata) enabled but model API key not found, disabling metadata extraction")
 
     def normalize_text(self, text: str) -> str:
-        if pd.isnull(text) or len(text)==0:
-            return text
-        if self.cfg.vectara.get("mask_pii", False):
-            text = mask_pii(text)
-        text = unicodedata.normalize('NFD', text)
-        return text
+        return normalize_text(text, self.cfg)
 
     def normalize_value(self, v):
-        if isinstance(v, str):
-            return self.normalize_text(v)
-        else:
-            return v
-    
+        return normalize_value(v, self.cfg)
+
     def setup(self, use_playwright: bool = True) -> None:
         self.session = create_session_with_retries()
-        # Create playwright browser so we can reuse it across all Indexer operations
-        if use_playwright:
-            self.p = sync_playwright().start()
-            self.browser = self.p.firefox.launch(headless=True)
-            self.browser_use_count = 0
-        self.tmp_file = 'tmp_' + str(uuid.uuid4())
+        configure_session_for_ssl(self.session, self.cfg.vectara)
+
+        # Browser handling is now done by WebContentExtractor
         if self.store_docs:
-            self.store_docs_folder = '/home/vectara/env/indexed_docs_' + str(uuid.uuid4())
-            if os.path.exists(self.store_docs_folder):
-                shutil.rmtree(self.store_docs_folder)
-            os.makedirs(self.store_docs_folder)
+            uuid_suffix = f"indexed_docs_{str(uuid.uuid4())}"
+            docker_output_path = f'/home/vectara/{self.output_dir}'
+
+            self.store_docs_folder = get_docker_or_local_path(
+                docker_path=os.path.join(docker_output_path, uuid_suffix),
+                output_dir=os.path.join(self.output_dir, uuid_suffix),
+                should_delete_existing=True
+            )
 
     def store_file(self, filename: str, orig_filename) -> None:
         if self.store_docs:
             dest_path = f"{self.store_docs_folder}/{orig_filename}"
             shutil.copyfile(filename, dest_path)
 
-
     def url_triggers_download(self, url: str) -> bool:
-        download_triggered = False
-        context = self.browser.new_context()
+        self._init_processors()
+        # Direct sync call since WebContentExtractor is now sync
+        return self.web_extractor.url_triggers_download(url)
 
-        # Define the event listener for download
-        def on_download(download):
-            nonlocal download_triggered
-            download_triggered = True
-
-        page = context.new_page()
-        page.set_extra_http_headers(get_headers)
-        page.on('download', on_download)
-        try:
-            page.goto(url, wait_until="domcontentloaded")
-        except Exception:
-            pass
-
-        page.close()
-        context.close()
-        return download_triggered
-
-    def fetch_page_contents(self, url: str, remove_code: bool = False, debug: bool = False) -> dict:
+    def fetch_page_contents(
+            self,
+            url: str,
+            extract_tables: bool = False,
+            extract_images: bool = False,
+            remove_code: bool = False,
+            html_processing: dict = None,
+            debug: bool = False
+    ) -> dict:
         '''
-        Fetch content from a URL with a timeout.
+        Fetch content from a URL with a timeout, including content from the Shadow DOM.
+        '''
+        self._init_processors()
+        # Direct sync call since WebContentExtractor is now sync
+        return self.web_extractor.fetch_page_contents(
+            url, extract_tables, extract_images, remove_code, html_processing, debug
+        )
+    
+    def check_download_or_pdf(self, url: str, timeout: int = 5000):
+        """Check if URL triggers download or serves PDF content directly"""
+        self._init_processors()
+        # Direct sync call since WebContentExtractor is now sync
+        return self.web_extractor.check_download_or_pdf(url, get_headers(self.cfg), timeout)
+
+
+    def _does_doc_exist(self, doc_id: str) -> bool:
+        """
+        Check if a document exists in the Vectara corpus with caching.
+
+        NOTE: This method is no longer used in the main indexing path (index_document, index_file)
+        as we now use an optimistic approach - attempting to index first and handling
+        conflicts only when they occur. This significantly reduces API calls.
+
         Args:
-            url (str): URL to fetch.
-            remove_code (bool): Whether to remove code from the HTML content.
-            debug (bool): Whether to enable playwright debug logging.
+            doc_id (str): ID of the document to check.
+
         Returns:
-            dict with
-            - 'text': text extracted from the page
-            - 'html': html of the page
-            - 'url': final URL of the page (if redirect)
-            - 'links': list of links in the page
-        '''
-        page = context = None
-        text = ''
-        html = ''
-        title = ''
-        links = []
-        out_url = url
-        try:
-            context = self.browser.new_context()
-            page = context.new_page()
-            page.set_extra_http_headers(get_headers)
-            page.route("**/*", lambda route: route.abort()  # do not load images as they are unnecessary for our purpose
-                if route.request.resource_type == "image" 
-                else route.continue_() 
-            ) 
-            if debug:
-                page.on('console', lambda msg: self.logger.info(f"playwright debug: {msg.text})"))
-
-            page.goto(url, timeout=self.timeout*1000, wait_until="domcontentloaded")
-            page.wait_for_timeout(self.post_load_timeout*1000)  # Wait an additional time to handle AJAX or animations
-            links_script = """Array.from(document.querySelectorAll('a')).map(a => a.href)"""
-            links = page.evaluate(links_script)
-            title = page.title()
-            html = page.content()
-            out_url = page.url
-            text = page.evaluate(f"""() => {{
-                // Extract main text content
-                let content = document.body.innerText;
-                
-                // Remove common boilerplate elements
-                const elementsToRemove = [
-                    'header',
-                    'footer',
-                    'nav',
-                    'aside',
-                    '.sidebar',
-                    '#comments',
-                    '.advertisement'
-                ];
-                
-                elementsToRemove.forEach(selector => {{
-                    const elements = document.querySelectorAll(selector);
-                    elements.forEach(el => {{
-                        content = content.replace(el.innerText, '');
-                    }});
-                }});
-                
-                {'// Remove code elements' if remove_code else ''}
-                {'''
-                const codeElements = document.querySelectorAll('code, pre');
-                codeElements.forEach(el => {{
-                    content = content.replace(el.innerText, '');
-                }});
-                ''' if remove_code else ''}
-                
-                // Remove extra whitespace
-                content = content.replace(/\\s+/g, ' ').trim();
-                
-                return content;
-            }}""")
-
-        except PlaywrightTimeoutError:
-            self.logger.info(f"Page loading timed out for {url} after {self.timeout} seconds")
-
-        except Exception as e:
-            self.logger.info(f"Page loading failed for {url} with exception '{e}'")
-            if not self.browser.is_connected():
-                self.browser = self.p.firefox.launch(headless=True)
+            bool: True if the document exists, False otherwise.
+        """
+        # Check cache first - this moves item to end (most recently used)
+        if doc_id in self._doc_exists_cache:
+            self._doc_exists_cache.move_to_end(doc_id)
+            return self._doc_exists_cache[doc_id]
         
-        finally:
-            if page:
-                page.close()
-            if context:
-                context.close()
-            self.browser_use_count += 1
-            if self.browser_use_count >= self.browser_use_limit:
-                self.browser.close()
-                self.browser = self.p.firefox.launch(headless=True)
-                self.browser_use_count = 0
-                self.logger.info(f"browser reset after {self.browser_use_limit} uses to avoid memory issues")
-            
-        return {
-            'text': text, 'html': html, 'title': title,
-            'url': out_url, 'links': links
+        post_headers = {
+            'x-api-key': self.api_key,
+            'X-Source': self.x_source
         }
+        encoded_doc_id = urllib.parse.quote(doc_id, safe='')
+        response = self.session.get(
+            f"{self.api_url}/v2/corpora/{self.corpus_key}/documents/{encoded_doc_id}",
+            headers=post_headers)
+
+        exists = response.status_code == 200
+        
+        # LRU eviction: remove least recently used item when cache is full
+        if len(self._doc_exists_cache) >= self._max_cache_size:
+            self._doc_exists_cache.popitem(last=False)
+        
+        self._doc_exists_cache[doc_id] = exists
+        return exists
 
     # delete document; returns True if successful, False otherwise
     def delete_doc(self, doc_id: str) -> bool:
@@ -273,201 +373,414 @@ class Indexer(object):
         Returns:
             bool: True if the delete was successful, False otherwise.
         """
-        body = {'customer_id': self.customer_id, 'corpus_id': self.corpus_id, 'document_id': doc_id}
-        post_headers = { 
-            'x-api-key': self.api_key, 
-            'customer-id': str(self.customer_id), 
+        post_headers = {
+            'x-api-key': self.api_key,
             'X-Source': self.x_source
         }
-        response = self.session.post(
-            f"https://{self.endpoint}/v1/delete-doc", data=json.dumps(body),
-            verify=True, headers=post_headers)
-        
-        if response.status_code != 200:
-            self.logger.error(f"Delete request failed for doc_id = {doc_id} with status code {response.status_code}, reason {response.reason}, text {response.text}")
+
+        encoded_doc_id = urllib.parse.quote(doc_id, safe='')
+        try:
+            response = self.session.delete(
+                f"{self.api_url}/v2/corpora/{self.corpus_key}/documents/{encoded_doc_id}",
+                headers=post_headers)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Delete request failed for doc_id = {doc_id}: {e}")
             return False
+
+        if response.status_code != 204:
+            logger.error(
+                f"Delete request failed for doc_id = {doc_id} with status code {response.status_code}, reason {response.reason}, text {response.text}")
+            return False
+        
+        # Clear from cache since it's now deleted
+        self._doc_exists_cache.pop(doc_id, None)
         return True
-    
-    def _list_docs(self) -> List[Dict[str, str]]:
+
+    def _list_docs(self, metadata_filter: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         List documents in the corpus.
+
+        Args:
+            metadata_filter (str, optional): Raw Vectara metadata filter expression (same
+                syntax as a query metadata filter, e.g. "doc.source = 'website'"). NOTE: the
+                list API only honors filters on metadata declared as a *filter attribute* on
+                the corpus; otherwise it errors. Source-scoping for incremental crawls is done
+                client-side in build_manifest instead, so it does not depend on corpus config.
+
         Returns:
-            list of [docId, URL] for each document in the corpus
-            URL taken from metadata if exists, otherwise it'd be None
+            list of dicts, one per document, with: id, url, source, fingerprint, content_hash,
+            config_sig, last_updated, parent_doc_id, sitemap_lastmod, pub_date. Values are
+            taken from metadata; missing keys are None.
         """
         page_key = None  # Initialize page_key as None
         docs = []
-    
+
         # Loop until there's no next page
         while True:
-            body = {"corpusId": self.corpus_id, "numResults": 1000}
+            params = {"limit": 1000}
             if page_key:  # Add page_key to the request if it's not None
-                body["pageKey"] = page_key
+                params["page_key"] = page_key
+            if metadata_filter:
+                params["metadata_filter"] = metadata_filter
 
-            post_headers = { 
-                'x-api-key': self.api_key, 
-                'customer-id': str(self.customer_id), 
+            post_headers = {
+                'x-api-key': self.api_key,
                 'X-Source': self.x_source
             }
-            response = self.session.post(
-                f"https://{self.endpoint}/v1/list-documents", data=json.dumps(body),
-                verify=True, headers=post_headers)
+            response = self.session.get(
+                f"{self.api_url}/v2/corpora/{self.corpus_key}/documents",
+                headers=post_headers, params=params)
             if response.status_code != 200:
-                self.logger.error(f"Error listing documents with status code {response.status_code}")
+                logger.error(f"Error listing documents with status code {response.status_code}")
                 return []
             res = response.json()
 
-            # Extract URLs from documents
-            for doc in res['document']:
-                url = next((md['value'] for md in doc['metadata'] if md['name'] == 'url'), None)
-                docs.append({'doc_id': doc['id'], 'url': url})
+            # Extract id + reindexing fields from document metadata
+            for doc in res.get('documents', []):
+                md = doc.get('metadata', {}) or {}
+                docs.append({
+                    'id': doc['id'],
+                    'url': md.get('url'),
+                    'source': md.get('source'),
+                    'fingerprint': md.get('fingerprint'),
+                    'content_hash': md.get('content_hash'),
+                    'config_sig': md.get('config_sig'),
+                    'last_updated': md.get('last_updated'),
+                    'parent_doc_id': md.get('parent_doc_id'),
+                    'sitemap_lastmod': md.get('sitemap_lastmod'),
+                    'pub_date': md.get('pub_date'),
+                })
 
+            response_metadata = res.get('metadata', None)
             # Check if we need to go further
-            page_key = res.get('nextPageKey', None)    
-            if not page_key:  # Break the loop if there's no next page
+            if not response_metadata or not response_metadata['page_key']:  # Break the loop if there's no next page
                 break
-    
+            else:
+                page_key = response_metadata['page_key']
+
         return docs
 
-    def _index_file(self, filename: str, uri: str, metadata: Dict[str, Any]) -> bool:
+
+    def _incremental_skip(self, content_hash: Optional[str], metadata: Dict[str, Any],
+                          prior_fingerprint: Optional[str]) -> bool:
         """
-        Index a file on local file system by uploading it to the Vectara corpus.
-        Args:
-            filename (str): Name of the file to create.
-            uri (str): URI for where the document originated. In some cases the local file name is not the same, and we want to include this in the index.
-            metadata (dict): Metadata for the document.
-        Returns:
-            bool: True if the upload was successful, False otherwise.
+        Incremental reindexing decision + metadata stamping (no-op unless `incremental`).
+
+        Computes the composite content+metadata+config fingerprint from the *source* metadata
+        (call before pipeline-derived fields are added so the value is stable across runs),
+        stamps `content_hash`/`fingerprint`/`config_sig`/`source` into `metadata` for
+        round-trip, and returns True if the document is unchanged and should be skipped.
+        The standalone `config_sig` stamp lets the crawlers' Layer-1 pre-fetch skips detect a
+        processing-config change (the composite fingerprint can't be checked without a fetch).
+
+        Idempotent: a fingerprint is already present (e.g. index_url delegating to index_file)
+        means an upstream call already decided — don't recompute or re-skip.
+        """
+        if not self.incremental or 'fingerprint' in metadata:
+            return False
+        fingerprint = compute_fingerprint(content_hash, metadata, self.config_sig)
+        if prior_fingerprint and prior_fingerprint == fingerprint:
+            self.last_skip_reason = "unchanged"
+            return True
+        if content_hash:
+            metadata['content_hash'] = content_hash
+        metadata['fingerprint'] = fingerprint
+        metadata['config_sig'] = self.config_sig
+        metadata['source'] = self.source_tag
+        return False
+
+    @staticmethod
+    def _hash_file(filename: str) -> str:
+        """Streaming md5 of a file's raw bytes (memory-safe for large files). Not a security
+        hash (usedforsecurity=False keeps FIPS builds and scanners happy)."""
+        h = hashlib.md5(usedforsecurity=False)
+        with open(filename, 'rb') as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def was_skipped(self) -> bool:
+        """True if the most recent index_* call skipped an unchanged document (incremental).
+        Lets crawler workers distinguish a skip from a fresh index without poking at the
+        last_skip_reason attribute directly."""
+        return self.last_skip_reason == "unchanged"
+
+    def stamp_subdoc_metadata(self, sub_metadata: Dict[str, Any], parent_doc_id: str) -> None:
+        """Tag a sub-document (image / PDF part / media transcript / spreadsheet sheet) so the
+        deletion pass treats it as present iff its parent is present, and so it carries the same
+        `source` scope. Public so file crawlers can tag docs they create via index_media_file /
+        the dataframe parser. No-op unless incremental."""
+        if not self.incremental or sub_metadata is None:
+            return
+        sub_metadata['parent_doc_id'] = parent_doc_id
+        sub_metadata['source'] = self.source_tag
+
+    def _index_file(self, filename: str, uri: str, metadata: Dict[str, Any], id: str = None) -> bool:
+        """
+        Index a file on local file system by uploading it to the Vectara corpus, using APIv2
         """
         if not os.path.exists(filename):
-            self.logger.error(f"File {filename} does not exist")
+            logger.error(f"File {filename} does not exist")
             return False
 
-        def get_files(filename: str, metadata: dict):
-            return  {
-                "file": (uri, open(filename, 'rb')),
-                "doc_metadata": (None, json.dumps(metadata)),
-            }  
+        metadata = prepare_file_metadata(metadata, filename, self.static_metadata)
 
-        post_headers = { 
+        post_headers = {
+            'Accept': 'application/json',
             'x-api-key': self.api_key,
-            'customer-id': str(self.customer_id),
-            'X-Source': self.x_source
         }
-        response = self.session.post(
-            f"https://{self.endpoint}/upload?c={self.customer_id}&o={self.corpus_id}&d=True",
-            files=get_files(filename, metadata), verify=True, headers=post_headers
-        )
-        if response.status_code == 409:
-            if self.reindex:
-                doc_id = response.json()['details'].split('document id')[1].split("'")[1]
-                self.delete_doc(doc_id)
-                response = self.session.post(
-                    f"https://{self.endpoint}/upload?c={self.customer_id}&o={self.corpus_id}",
-                    files=get_files(filename, metadata), verify=True, headers=post_headers
-                )
-                if response.status_code == 200:
-                    self.logger.info(f"REST upload for {uri} successful (reindex)")
-                    self.store_file(filename, url_to_filename(uri))
-                    return True
-                else:
-                    self.logger.info(f"REST upload for {uri} ({filename}) (reindex) failed with code = {response.status_code}, text = {response.text}")
-                    return True
-            return False
-        elif response.status_code != 200:
-            self.logger.error(f"REST upload for {uri} failed with code {response.status_code}, text = {response.text}")
+        url = f"{self.api_url}/v2/corpora/{self.corpus_key}/upload_file"
+        upload_filename = id if id is not None else os.path.basename(filename)
+
+        # Simple approach: upload the file, replacing on conflict when reindex or incremental is set
+        try:
+            with open(filename, 'rb') as file_handle:
+                files, _, content_type = create_upload_files_dict(filename, metadata, self.parse_tables, self.cfg)
+                files['file'] = (upload_filename, file_handle, content_type)
+                response = self.session.request("POST", url, headers=post_headers, files=files)
+        except Exception as e:
+            logger.error(f"Exception {e} while uploading file {filename}")
+            self.last_error = f"upload exception: {e}"
             return False
 
-        self.logger.info(f"REST upload for {uri} succeesful")
-        self.store_file(filename, url_to_filename(uri))
-        return True
+        # Handle the response
+        if response.status_code == 201:
+            if self.verbose:
+                logger.info(f"File {uri} indexed successfully")
+            if self.store_docs:
+                store_file(filename, url_to_filename(uri), self.store_docs, self.store_docs_folder)
+            return True
+        elif response.status_code in [409, 412]:
+            # reindex replaces on conflict by request; incremental implies it — a doc only
+            # reaches this upload if it is new or changed, so an existing-doc conflict means
+            # the content changed and must be replaced (else the update is silently dropped).
+            if self.reindex or self.incremental:
+                # File already exists and must be replaced
+                if self.verbose:
+                    logger.info(f"File {uri} already exists. Deleting and re-indexing...")
 
-    def _index_document(self, document: Dict[str, Any]) -> bool:
+                # The 409 names the EXISTING doc's id, which is not always the id we
+                # just sent: when the same content was indexed under a different id
+                # scheme in a prior run (e.g. a folder crawl's slugify(name)-<hash>),
+                # Vectara's content-dedup references that prior id. Delete the id the
+                # server reports; fall back to ours when it carries none (e.g. 412).
+                doc_id = parse_conflict_doc_id(response.text) or (id if id else os.path.basename(filename))
+
+                # Delete the existing document
+                if self.delete_doc(doc_id):
+                    # Retry the upload
+                    try:
+                        with open(filename, 'rb') as file_handle:
+                            files, _, content_type = create_upload_files_dict(filename, metadata, self.parse_tables, self.cfg)
+                            files['file'] = (upload_filename, file_handle, content_type)
+                            response = self.session.request("POST", url, headers=post_headers, files=files)
+
+                        if response.status_code == 201:
+                            if self.verbose:
+                                logger.info(f"File {uri} re-indexed successfully")
+                            if self.store_docs:
+                                store_file(filename, url_to_filename(uri), self.store_docs, self.store_docs_folder)
+                            return True
+                        # Re-upload returned a non-201 — fall through to the
+                        # generic error path below so the status code lands in
+                        # last_error.
+                    except Exception as e:
+                        logger.error(f"Failed to re-index file {uri}: {e}")
+                        self.last_error = f"re-upload exception: {e}"
+                        return False
+            else:
+                # File already exists but reindex is disabled - treat as success
+                if self.verbose:
+                    logger.info(f"File {uri} already exists (skipping, already indexed)")
+                return True
+
+        # Log error for any other status code
+        logger.error(f"Failed to upload file {uri}. Status code: {response.status_code}, Message: {response.text}")
+        self.last_error = f"upload returned HTTP {response.status_code}: {response.text[:200]}"
+        return False
+
+    def index_document(self, document: Dict[str, Any], use_core_indexing: bool = False,
+                       prior_fingerprint: Optional[str] = None,
+                       content_hash_override: Optional[str] = None) -> bool:
         """
         Index a document (by uploading it to the Vectara corpus) from the document dictionary
-        """
-        api_endpoint = f"https://{self.endpoint}/v1/index"
 
-        request = {
-            'customer_id': self.customer_id,
-            'corpus_id': self.corpus_id,
-            'document': document,
-        }
-
-        post_headers = { 
-            'x-api-key': self.api_key,
-            'customer-id': str(self.customer_id),
-            'X-Source': self.x_source
-        }
-        try:
-            data = json.dumps(request)
-        except Exception as e:
-            self.logger.info(f"Can't serialize request {request} (error {e}), skipping")   
-            return False
-
-        try:
-            response = self.session.post(api_endpoint, data=data, verify=True, headers=post_headers)
-        except Exception as e:
-            self.logger.info(f"Exception {e} while indexing document {document['documentId']}")
-            return False
-
-        if response.status_code != 200:
-            self.logger.error("REST upload failed with code %d, reason %s, text %s",
-                          response.status_code,
-                          response.reason,
-                          response.text)
-            return False
-
-        result = response.json()
-        if "status" in result and result["status"] and \
-           ("ALREADY_EXISTS" in result["status"]["code"] or \
-            ("CONFLICT" in result["status"]["code"] and "Indexing doesn't support updating documents" in result["status"]["statusDetail"])):
-            if self.reindex:
-                self.logger.info(f"Document {document['documentId']} already exists, re-indexing")
-                self.delete_doc(document['documentId'])
-                response = self.session.post(api_endpoint, data=json.dumps(request), verify=True, headers=post_headers)
-                return True
-            else:
-                self.logger.info(f"Document {document['documentId']} already exists, skipping")
-                return False
-        if "status" in result and result["status"] and "OK" in result["status"]["code"]:
-            if self.store_docs:
-                with open(f"{self.store_docs_folder}/{document['documentId']}.json", "w") as f:
-                    json.dump(document, f)
-            return True
-        
-        self.logger.info(f"Indexing document {document['documentId']} failed, response = {result}")
-        return False
-    
-    def index_url(self, url: str, metadata: Dict[str, Any], html_processing: dict = {}) -> bool:
-        """
-        Index a url by rendering it with scrapy-playwright, extracting paragraphs, then uploading to the Vectara corpus.
         Args:
-            url (str): URL for where the document originated. 
-            metadata (dict): Metadata for the document.
+            document (dict): Document to index.
+            use_core_indexing (bool): Whether to use the core indexing API.
+            prior_fingerprint (str, optional): When incremental reindexing is enabled, the
+                fingerprint this document had in the corpus on the prior run. If the freshly
+                computed fingerprint matches, the upload is skipped. Lets crawlers that index
+                via structured documents (e.g. notion) use the same skip path as index_url.
+            content_hash_override (str, optional): Use this as the content signal instead of
+                hashing the section text. Required when the section text is non-deterministic
+                across runs (e.g. a gdrive native Sheet, whose dataframe sections are an LLM
+                table summary) — pass a stable signal like Drive's modifiedTime so the
+                fingerprint is comparable run-to-run.
+
         Returns:
             bool: True if the upload was successful, False otherwise.
         """
+        self._last_response_status = None
+        self.last_skip_reason = None
+        api_endpoint = f"{self.api_url}/v2/corpora/{self.corpus_key}/documents"
+
+        # Prepare the document data
+        if self.static_metadata:
+            metadata = None
+            if 'metadata' in document:
+                metadata = document['metadata']
+            else:
+                metadata = {}
+                document['metadata'] = metadata
+            metadata.update({k: v for k, v in self.static_metadata.items() if k not in metadata})
+
+        # Normalize URLs in document metadata
+        if 'metadata' in document and 'url' in document['metadata']:
+            document['metadata']['url'] = normalize_url_for_metadata(document['metadata']['url'])
+        
+        # Normalize URLs in section metadata
+        if 'sections' in document:
+            for section in document['sections']:
+                if 'metadata' in section and 'url' in section['metadata']:
+                    section['metadata']['url'] = normalize_url_for_metadata(section['metadata']['url'])
+
+        # Incremental reindexing: fingerprint over the document's text + metadata + config,
+        # stamped into doc metadata and used to skip an unchanged document before upload.
+        if self.incremental and 'metadata' in document:
+            content_hash = (content_hash_override if content_hash_override is not None
+                            else md5_hex("".join(s.get('text', '') for s in document.get('sections', []))))
+            if self._incremental_skip(content_hash, document['metadata'], prior_fingerprint):
+                if self.verbose:
+                    logger.info(f"Document {document['id']} unchanged (fingerprint match) — skipping")
+                return True
+
+        if use_core_indexing:
+            document['type'] = 'core'
+        else:
+            document['type'] = 'structured'
+
+        if not self.use_core_indexing:
+            chunking_config = get_chunking_config(self.cfg)
+            if chunking_config:
+                document['chunking_strategy'] = chunking_config
+
+        post_headers = {
+            'x-api-key': self.api_key,
+            'X-Source': self.x_source
+        }
+
+        try:
+            data = json.dumps(document)
+        except Exception as e:
+            logger.info(f"Can't serialize document {document} (error {e}), skipping")
+            return False
+
+        doc_size = len(data.encode('utf-8'))
+        if doc_size < 1024:
+            logger.info(f"Document '{document['id']}' size: {doc_size} bytes")
+        else:
+            logger.info(f"Document '{document['id']}' size: {doc_size / 1024:.1f} KB")
+
+        # Simple approach: POST the document, replacing on conflict when reindex or incremental is set
+        try:
+            response = self.session.post(api_endpoint, data=data, headers=post_headers)
+        except Exception as e:
+            logger.info(f"Exception {e} while indexing document {document['id']}")
+            return False
+
+        self._last_response_status = response.status_code
+
+        # Handle the response
+        if response.status_code == 201:
+            if self.verbose:
+                logger.info(f"Document {document['id']} indexed successfully")
+            if self.store_docs:
+                with open(f"{self.store_docs_folder}/{document['id']}.json", "w") as f:
+                    json.dump(document, f)
+            return True
+        elif response.status_code in [409, 412]:
+            # See _index_file: incremental implies replace-on-conflict, because an unchanged
+            # document would have been skipped before upload — a conflict here means it changed.
+            if self.reindex or self.incremental:
+                # Document already exists and must be replaced
+                if self.verbose:
+                    logger.info(f"Document {document['id']} already exists. Deleting and re-indexing...")
+
+                # Delete the existing document
+                if self.delete_doc(document['id']):
+                    # Retry the upload
+                    try:
+                        response = self.session.post(api_endpoint, data=data, headers=post_headers)
+                        self._last_response_status = response.status_code
+                        if response.status_code == 201:
+                            if self.verbose:
+                                logger.info(f"Document {document['id']} re-indexed successfully")
+                            if self.store_docs:
+                                with open(f"{self.store_docs_folder}/{document['id']}.json", "w") as f:
+                                    json.dump(document, f)
+                            return True
+                    except Exception as e:
+                        logger.error(f"Failed to re-index document {document['id']}: {e}")
+                        return False
+            else:
+                # Document already exists but reindex is disabled - treat as success
+                if self.verbose:
+                    logger.info(f"Document {document['id']} already exists (skipping, already indexed)")
+                return True
+
+        # Log error for any other status code
+        logger.error(f"Failed to index document {document['id']}. Status code: {response.status_code}, Message: {response.text}")
+        return False
+
+
+
+    def index_url(self, url: str, metadata: Dict[str, Any], html_processing: dict = None,
+                  metadata_extractor: callable = None, prior_fingerprint: Optional[str] = None) -> bool:
+        """
+        Index a url by rendering it, extracting content and metadata, then uploading to the Vectara corpus.
+
+        Args:
+            url (str): URL for where the document originated.
+            metadata (dict): Metadata for the document.
+            html_processing (dict): HTML processing configuration for removing unwanted elements.
+            metadata_extractor (callable): Optional function to extract additional metadata from HTML.
+                Function signature: fn(html: str) -> Dict[str, Any]
+                The extractor should return only metadata fields to be indexed.
+
+        Returns:
+            bool: True if the upload was successful, False otherwise.
+        """
+        succeeded = False
+        self.last_skip_reason = None
+        if html_processing is None:
+            html_processing = {}
         st = time.time()
-        url = url.split("#")[0]     # remove fragment, if exists
+        url = url.split("#")[0]  # remove fragment, if exists
 
         # if file is going to download, then handle it as local file
         if self.url_triggers_download(url):
-            file_path = self.tmp_file
-            response = self.session.get(url, headers=get_headers, stream=True)
+            os.makedirs("/tmp", exist_ok=True)
+            url_file_path = get_file_path_from_url(url)
+            if not url_file_path:
+                logger.error(f"Failed to extract file path from URL {url}, skipping...")
+                return False
+            file_path = os.path.join("/tmp/" + url_file_path)
+
+            response = self.session.get(url, headers=get_headers(self.cfg), stream=True)
             if response.status_code == 200:
                 with open(file_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192): 
+                    for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
-                self.logger.info(f"File downloaded successfully and saved as {file_path}")
-                res =  self.index_file(file_path, url, metadata)
+                logger.info(f"File downloaded successfully and saved as {file_path}")
+                res = self.index_file(file_path, url, metadata, prior_fingerprint=prior_fingerprint)
                 safe_remove_file(file_path)
-                return res            
+                return res
             else:
-                self.logger.info(f"Failed to download file. Status code: {response.status_code}")
+                logger.error(f"Failed to download file. Status code: {response.status_code}")
                 return False
 
-        # If MD, RST of IPYNB file, then we don't need playwright - can just download content directly and convert to text
+        # If MD or IPYNB file, then we don't need playwright - can just download content directly and convert to text
         if url.lower().endswith(".md") or url.lower().endswith(".ipynb"):
             response = self.session.get(url, timeout=self.timeout)
             response.raise_for_status()
@@ -475,120 +788,893 @@ class Indexer(object):
             if url.lower().endswith('md'):
                 html_content = markdown.markdown(dl_content)
             elif url.lower().endswith('ipynb'):
-                nb = nbformat.reads(dl_content, nbformat.NO_CONVERT)    # type: ignore
+                nb = nbformat.reads(dl_content, as_version=4)
                 exporter = HTMLExporter()
                 html_content, _ = exporter.from_notebook_node(nb)
-            extracted_title = url.split('/')[-1]      # no title in these files, so using file name
-            text = html_to_text(html_content, self.remove_code)
+            doc_title = os.path.basename(url)  # no title in these files, so using file name
+            text = html_to_text(html_content, self.remove_code, html_processing=html_processing)
             parts = [text]
 
         else:
             try:
-                # Use Playwright to get the page content
-                res = self.fetch_page_contents(url, self.remove_code)
+                # Check if URL triggers download or serves PDF content
+                result = self.check_download_or_pdf(url)
+                
+                if result["type"] == "download":
+                    # Handle explicit download
+                    download = result["download"]
+                    final_url = result["url"]
+                    if 'url' in metadata:
+                        metadata['url'] = normalize_url_for_metadata(final_url)
+                    suggested = result["filename"] or ""
+                    ext = os.path.splitext(suggested)[1]
+                    if not ext:
+                        parsed = urllib.parse.urlparse(final_url)
+                        ext = os.path.splitext(parsed.path)[1] or ".pdf"
+                    filename = suggested or f"{uuid.uuid4()}{ext}"
+                    
+                    file_path = os.path.join(tempfile.gettempdir(), filename)
+                    download.save_as(file_path)
+                    result = self.index_file(file_path, final_url, metadata, prior_fingerprint=prior_fingerprint)
+                    safe_remove_file(file_path)
+                    return result
+                    
+                elif result["type"] == "pdf":
+                    # Handle inline PDF
+                    final_url = result["url"]
+                    parsed = urllib.parse.urlparse(final_url)
+                    ext = os.path.splitext(parsed.path)[1] or ".pdf"
+                    filename = os.path.basename(parsed.path) or f"{uuid.uuid4()}{ext}"
+                    file_path = os.path.join(tempfile.gettempdir(), filename)
+                    
+                    if 'url' in metadata:
+                        metadata['url'] = normalize_url_for_metadata(final_url)
+                    with open(file_path, "wb") as f:
+                        f.write(result["content"])
+                    res = self.index_file(file_path, final_url, metadata, prior_fingerprint=prior_fingerprint)
+                    safe_remove_file(file_path)
+                    return res
+
+                # If not download or PDF, fetch the page content
+                res = self.fetch_page_contents(
+                    url=url,
+                    extract_tables=self.parse_tables,
+                    extract_images=False,
+                    remove_code=self.remove_code,
+                    html_processing=html_processing,
+                )
+                # If the fetch was bounced to a sign-in / IdP page, treat it
+                # as a crawl failure: do not index the login form's HTML.
+                auth_reason = auth_redirect_reason(url, res.get('url'))
+                if auth_reason:
+                    logger.warning(
+                        f"Skipping {url}: {auth_reason} ({res.get('url')}). "
+                        f"This usually means the page requires authentication; "
+                        f"configure website_crawler.google_auth / saml_auth "
+                        f"(or grant access to the configured account) to crawl it."
+                    )
+                    self.last_skip_reason = auth_reason
+                    return False
                 html = res['html']
                 text = res['text']
-
-                extracted_title = res['title']
-
-                if text is None or len(text)<3:
+                doc_title = res['title']
+                metadata['url'] = normalize_url_for_metadata(res['url'])
+                if text is None or len(text) < 3:
                     return False
+
+                # Route web content through the local document parser when configured,
+                # or when the page has images we must attach as binary data: the inline
+                # web path below always builds a *structured* document, but binary images
+                # require *core* (see add_image_bytes handling in index_segments). Routing
+                # through index_file parses the HTML with docling, so the page is chunked
+                # and the images are attached to a valid core document.
+                route_locally = self.process_locally or (
+                    self.add_image_bytes and self.summarize_images and res.get('images')
+                )
+                if route_locally:
+                    temp_html_path = None
+                    try:
+                        # Save HTML to temporary file and process through doc parser
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as tmp_file:
+                            tmp_file.write(html)
+                            tmp_file.flush()
+                            temp_html_path = tmp_file.name
+
+                        if self.verbose:
+                            logger.info(f"Processing web content from {url} locally using doc parser: {self.doc_parser}")
+
+                        # Process through index_file which uses the configured document parser.
+                        # Docling misses images nested inside <p>/<li> tags — pass them
+                        # via extra_image_urls so index_file can supplement with web images.
+                        # force_local_processing: the source URI (a web URL) has no file
+                        # extension, so index_file's should_process_locally() heuristic would
+                        # send the temp .html down the raw upload path (Case A), bypassing the
+                        # docling parse + image-bytes attachment we routed here for.
+                        result = self.index_file(
+                            temp_html_path, url, metadata, title_hint=res.get('title', ''),
+                            extra_image_urls=res.get('images', []), prior_fingerprint=prior_fingerprint,
+                            content_hash_override=content_hash_from_text(text), force_local_processing=True
+                        )
+                        safe_remove_file(temp_html_path)
+                        return result
+                    except Exception as e:
+                        logger.warning(f"Failed to process {url} locally with doc parser: {e}. Falling back to web extraction.")
+                        if temp_html_path:
+                            safe_remove_file(temp_html_path)
+                        # Continue with normal web processing below
+
+                # Extract the last modified date from the HTML content.
+                ext_res = extract_last_modified(url, html)
+                last_modified = ext_res.get('last_modified', None)
+                if last_modified:
+                    metadata['last_updated'] = last_modified.strftime("%Y-%m-%d")
+
+                # Incremental reindexing: fingerprint from content + source metadata + config.
+                # Hash the normalized extracted text (not the rendered HTML, whose per-request
+                # noise changes every fetch) and compute it before extract_metadata / image
+                # summarization, so the value is stable across runs (LLM output excluded) and
+                # those costs plus the upload are skipped when the document is unchanged.
+                if self._incremental_skip(content_hash_from_text(text), metadata, prior_fingerprint):
+                    if self.verbose:
+                        logger.info(f"URL {url} unchanged (fingerprint match) — skipping")
+                    return True
+
+                # Extract custom metadata if extractor provided
+                if metadata_extractor and callable(metadata_extractor):
+                    try:
+                        extracted_metadata = metadata_extractor(html)
+                        if extracted_metadata:
+                            metadata.update(extracted_metadata)
+                    except Exception as e:
+                        logger.warning(f"Failed to execute metadata extractor for {url}: {e}")
 
                 # Detect language if needed
                 if self.detected_language is None:
                     self.detected_language = detect_language(text)
-                    self.logger.info(f"The detected language is {self.detected_language}")
+                    logger.info(f"The detected language is {self.detected_language}")
+
+                if len(self.extract_metadata) > 0:
+                    ex_metadata = get_attributes_from_text(
+                        self.cfg,
+                        text,
+                        metadata_questions=self.extract_metadata,
+                        model_config=self.model_config.text
+                    )
+                    metadata.update(ex_metadata)
+                else:
+                    ex_metadata = {}
 
                 #
-                # By default, 'text' is extracted above.
-                # If remove_boilerplate is True, then use it directly
-                # If no boilerplate remove but need to remove code, then we need to use html_to_text
+                # By default, 'text' is already extracted above in fetch_page_contents
+                # which applies html_processing (target_tag, target_class, preserve_links, etc.)
+                # Only re-extract if remove_boilerplate is explicitly enabled
                 #
                 if self.remove_boilerplate:
                     url = res['url']
                     if self.verbose:
-                        self.logger.info(f"Removing boilerplate from content of {url}, and extracting important text only")
-                    text, extracted_title = get_article_content(html, url, self.detected_language, self.remove_code)
-                else:
-                    text = html_to_text(html, self.remove_code, html_processing)
+                        logger.info(
+                            f"Removing boilerplate from content of {url}, and extracting important text only")
+                    text, doc_title = get_article_content(html, url, self.detected_language, self.remove_code)
+                # else: use text already extracted from res['text'] - don't re-extract!
 
                 parts = [text]
-                self.logger.info(f"retrieving content took {time.time()-st:.2f} seconds")
+                metadatas = [{'element_type': 'text'}]
+
+                # Process tables
+                vec_tables = []
+                if self.parse_tables and 'tables' in res:
+                    from core.table_extractor import TableExtractor
+                    table_extractor = TableExtractor(
+                        cfg=self.cfg,
+                        model_config=self.model_config,
+                        verbose=self.verbose
+                    )
+                    vec_tables = table_extractor.process_tables(res['tables'], url)
+
+                # Check if images should be indexed inline or separately
+                if self.file_processor.inline_images:
+                    # Inline mode: Process images and create unified content stream
+                    all_texts = []
+                    all_metadatas = []
+                    
+                    # Add text elements
+                    for text, segment_metadata in zip(parts, metadatas):
+                        all_texts.append(text)
+                        all_metadatas.append(segment_metadata)
+                    
+                    # Add image elements inline if images exist and summarization is enabled
+                    if self.summarize_images and 'images' in res:
+                        image_processor = ImageProcessor(
+                            cfg=self.cfg,
+                            model_config=self.model_config,
+                            verbose=self.verbose
+                        )
+                        processed_images, web_image_bytes = image_processor.process_web_images(res['images'], url, ex_metadata)
+                        if web_image_bytes and self.verbose:
+                            logger.info(f"URL {url} contains {len(web_image_bytes)} images with binary data available")
+                        
+                        for _, image_summary, image_metadata in processed_images:
+                            all_texts.append(image_summary)
+                            all_metadatas.append(image_metadata)
+                    
+                    # Index unified content in single document
+                    doc_id = slugify(normalize_url_for_metadata(url))
+                    succeeded = self.index_segments(
+                        doc_id=doc_id, 
+                        texts=all_texts, 
+                        metadatas=all_metadatas, 
+                        tables=vec_tables,
+                        doc_metadata=metadata, 
+                        doc_title=doc_title,
+                        image_bytes=web_image_bytes if 'web_image_bytes' in locals() else []
+                    )
+                else:
+                    # Legacy mode: Index text and images separately
+                    # Index text and tables first
+                    doc_id = slugify(normalize_url_for_metadata(url))
+                    parent_doc_id = doc_id
+                    succeeded = self.index_segments(
+                        doc_id=doc_id,
+                        texts=parts,
+                        metadatas=metadatas,
+                        tables=vec_tables,
+                        doc_metadata=metadata,
+                        doc_title=doc_title
+                    )
+                    
+                    # Index images as separate documents
+                    if self.summarize_images and 'images' in res:
+                        image_processor = ImageProcessor(
+                            cfg=self.cfg,
+                            model_config=self.model_config,
+                            verbose=self.verbose
+                        )
+                        processed_images, web_image_bytes = image_processor.process_web_images(res['images'], url, ex_metadata)
+                        if web_image_bytes and self.verbose:
+                            logger.info(f"URL {url} contains {len(web_image_bytes)} images with binary data available")
+                        
+                        for doc_id, image_summary, image_metadata in processed_images:
+                            # Pass web image bits if available and enabled
+                            image_bytes_param = web_image_bytes if self.add_image_bytes else []
+                            self.stamp_subdoc_metadata(image_metadata, parent_doc_id)
+
+                            succeeded &= self.index_segments(
+                                doc_id=doc_id,
+                                texts=[image_summary],
+                                metadatas=[image_metadata],
+                                doc_metadata=image_metadata,
+                                doc_title=doc_title,
+                                image_bytes=image_bytes_param,
+                                use_core_indexing=True
+                            )
+
+                # logger.info(f"retrieving content took {time.time() - st:.2f} seconds")
             except Exception as e:
                 import traceback
-                self.logger.info(f"Failed to crawl {url}, skipping due to error {e}, traceback={traceback.format_exc()}")
+                logger.error(
+                    f"Failed to crawl {url}, skipping due to error {e}, traceback={traceback.format_exc()}")
                 return False
-        
-        doc_id = slugify(url)
-        succeeded = self.index_segments(doc_id=doc_id, texts=parts,
-                                        doc_metadata=metadata, doc_title=extracted_title)
+
         return succeeded
 
-    def index_segments(self, doc_id: str, texts: List[str], titles: Optional[List[str]] = None, metadatas: Optional[List[Dict[str, Any]]] = None, 
-                       doc_metadata: Dict[str, Any] = {}, doc_title: str = "") -> bool:
+    def index_segments(self, doc_id: str, texts: List[str], titles: Optional[List[str]] = None,
+                       metadatas: Optional[List[Dict[str, Any]]] = None,
+                       doc_metadata: Dict[str, Any] = None, doc_title: str = "",
+                       tables: Optional[Sequence[Dict[str, Any]]] = None,
+                       image_bytes: Optional[List[Tuple[str, bytes]]] = None,
+                       use_core_indexing: bool = False,
+                       prior_fingerprint: Optional[str] = None,
+                       content_hash_override: Optional[str] = None) -> bool:
         """
         Index a document (by uploading it to the Vectara corpus) from the set of segments (parts) that make up the document.
-        """
-        if titles is None:
-            titles = ["" for _ in range(len(texts))]
-        if metadatas is None:
-            metadatas = [{} for _ in range(len(texts))]
-        else:
-            metadatas = [{k:self.normalize_value(v) for k,v in md.items()} for md in metadatas]
 
-        document = {}
-        document["documentId"] = doc_id
-        if doc_title is not None and len(doc_title)>0:
-            document["title"] = self.normalize_text(doc_title)
-        document["section"] = [
-            {"text": self.normalize_text(text), "title": self.normalize_text(title), "metadataJson": json.dumps(md)} 
-            for text,title,md in zip(texts,titles,metadatas)
-        ]
-        if doc_metadata:
-            document["metadataJson"] = json.dumps(doc_metadata)
-
-        if self.verbose:
-            self.logger.info(f"Indexing document {doc_id} with {document}")
-
-        return self.index_document(document)
-
-    def index_document(self, document: Dict[str, Any]) -> bool:
-        """
-        Index a document (by uploading it to the Vectara corpus).
-        Document is a dictionary that includes documentId, title, optionally metadataJson, and section (which is a list of segments).
-        """
-        return self._index_document(document)
-
-    def index_file(self, filename: str, uri: str, metadata: Dict[str, Any]) -> bool:
-        """
-        Index a file on local file system by uploading it to the Vectara corpus.
         Args:
-            filename (str): Name of the PDF file to create.
-            uri (str): URI for where the document originated. In some cases the local file name is not the same, and we want to include this in the index.
-            metadata (dict): Metadata for the document.
-        Returns:
-            bool: True if the upload was successful, False otherwise.
+            image_bytes: Optional list of (image_id, binary_data) tuples containing image binary data
+            prior_fingerprint: Incremental skip — the document's fingerprint on the prior run.
+            content_hash_override: Incremental content signal to use instead of the section text
+                hash (e.g. Drive modifiedTime for a native Sheet whose summary text drifts).
         """
-        if not os.path.exists(filename):
-            self.logger.error(f"File {filename} does not exist")
-            return False
+        self._init_processors()
         
-        # If we have a PDF fiel with size>50MB, or we want to use the summarize_tables option, then we parse locally and index
-        # Otherwise - send to Vectara's default upload fiel mechanism
-        size_limit = 50
-        large_file_extensions = ['.pdf', '.html', '.htm']
-        if (any(uri.endswith(extension) for extension in large_file_extensions) and
-           (get_file_size_in_MB(filename) >= size_limit or self.summarize_tables)):
-            openai_api_key = self.cfg.vectara.get("openai_api_key", None)
-            title, texts = parse_local_file(filename, uri, self.summarize_tables, openai_api_key)
-            succeeded = self.index_segments(doc_id=slugify(uri), texts=texts,
-                                            doc_metadata=metadata, doc_title=title)
-            if self.summarize_tables:
-                self.logger.info(f"For file {filename}, extracting text locally since summarize_tables is activated")
+        texts = list(texts) if texts else []
+        tables = list(tables) if tables else []
+        image_bytes = list(image_bytes) if image_bytes else []
+        image_bytes_dict = self._build_image_bytes_dict(image_bytes)
+
+        # Log image bits availability
+        if image_bytes_dict and self.verbose:
+            logger.info(f"Document {doc_id} has {len(image_bytes_dict)} images with binary data available for later upload")
+
+        # Binary image data (the images/document_parts fields) is only valid on *core*
+        # documents; a structured document carrying it is rejected by the API
+        # ("Unrecognized field images", and the core-only 'title'/'sections' mismatch).
+        # If we will attach image bytes below, build the document as core from the start
+        # so its shape (document_parts, no top-level title/sections) matches the type.
+        if (self.add_image_bytes and image_bytes and metadatas and not use_core_indexing
+                and any(m and m.get('image_id')
+                        and self._find_image_binary_data(m['image_id'], image_bytes_dict)
+                        for m in metadatas)):
+            logger.info(
+                f"Document {doc_id} carries binary image data (add_image_bytes); "
+                f"indexing via core instead of structured.")
+            use_core_indexing = True
+
+        from core.document_builder import DocumentBuilder
+        # Normalize URLs in doc_metadata
+        if doc_metadata and 'url' in doc_metadata:
+            doc_metadata['url'] = normalize_url_for_metadata(doc_metadata['url'])
+        
+        document_builder = DocumentBuilder(
+            cfg=self.cfg,
+            normalize_text_func=lambda text: normalize_text(text, self.cfg)
+        )
+        document = document_builder.build_document(
+            doc_id=doc_id,
+            texts=texts,
+            titles=titles,
+            metadatas=metadatas,
+            doc_metadata=doc_metadata,
+            doc_title=doc_title,
+            tables=tables,
+            use_core_indexing=use_core_indexing
+        )
+        
+        if document is None:
+            return False
+            
+        # Add image binary data if available and enabled
+        if self.add_image_bytes and image_bytes and metadatas:
+            images_array = []
+            updated_document_parts = []
+            
+            # Process each text/metadata pair to find images
+            for i, (raw_text, raw_metadata) in enumerate(zip(texts, metadatas)):
+                image_id = raw_metadata.get('image_id') if raw_metadata else None
+                # Mirror DocumentBuilder._build_core_document: normalize text and metadata
+                # (Unicode NFD + optional PII masking) so these rebuilt parts match every
+                # other core document instead of carrying raw/unmasked content.
+                text = self.normalize_text(raw_text)
+                metadata = ({k: self.normalize_value(v) for k, v in raw_metadata.items()}
+                            if raw_metadata else raw_metadata)
+                
+                if image_id:
+                    # Find binary data for this image
+                    binary_data = self._find_image_binary_data(image_id, image_bytes_dict)
+                    if binary_data:
+                        mime_type = self._detect_image_mime_type(image_id, binary_data)
+                        
+                        # Add to images array - encode binary data as base64 for JSON serialization
+                        images_array.append({
+                            "id": image_id,
+                            "caption": "",
+                            "description": text,
+                            "image_data": {
+                                "data": base64.b64encode(binary_data).decode('utf-8'),
+                                "mime_type": mime_type
+                            }
+                        })
+                        
+                        # Update document part to reference the image
+                        updated_document_parts.append({
+                            "text": text,
+                            "image_id": image_id,
+                            "metadata": metadata
+                        })
+                        
+                        if self.verbose:
+                            logger.info(f"Added binary data for image {image_id} with MIME type {mime_type}")
+                    else:
+                        # No binary data found, add as regular text (split if oversized).
+                        for chunk in DocumentBuilder._split_text(text, MAX_PART_SIZE):
+                            updated_document_parts.append({
+                                "text": chunk,
+                                "metadata": metadata
+                            })
+                        if self.verbose:
+                            logger.warning(f"Binary data not found for image {image_id}")
+                else:
+                    # Regular text element — split to stay under the core part-size limit,
+                    # mirroring _build_core_document (this path bypasses build_document's split).
+                    for chunk in DocumentBuilder._split_text(text, MAX_PART_SIZE):
+                        updated_document_parts.append({
+                            "text": chunk,
+                            "metadata": metadata
+                        })
+            
+            # Update document structure if we found any images with binary data.
+            # use_core_indexing was already forced True above (pre-build) whenever this
+            # is non-empty, so the document was built in core shape and these core-only
+            # fields are valid.
+            if images_array:
+                document["images"] = images_array
+                document["document_parts"] = updated_document_parts
+                if self.verbose:
+                    logger.info(f"Document {doc_id} now includes {len(images_array)} images with binary data")
+            
+        if self.verbose:
+            logger.info(f"Indexing document {doc_id} with json {str(document)[:1000]}...")
+
+        result = self.index_document(document, use_core_indexing,
+                                     prior_fingerprint=prior_fingerprint,
+                                     content_hash_override=content_hash_override)
+
+        if (not result and not use_core_indexing and self._last_response_status == 400
+                and _document_has_oversized_part(document)):
+            logger.info(f"Document {doc_id} failed with an oversized-part 400, "
+                        f"retrying with split_oversized=True")
+            document_retry = document_builder.build_document(
+                doc_id=doc_id,
+                texts=texts,
+                titles=titles,
+                metadatas=metadatas,
+                doc_metadata=doc_metadata,
+                doc_title=doc_title,
+                tables=tables,
+                use_core_indexing=use_core_indexing,
+                split_oversized=True
+            )
+            if document_retry is not None:
+                self.delete_doc(document_retry['id'])
+                result = self.index_document(document_retry, use_core_indexing)
+
+        return result
+
+    def index_file(self, filename: str, uri: str, metadata: Dict[str, Any], id: str = None, title_hint: str = None,
+                   extra_image_urls: Optional[List[Dict[str, str]]] = None,
+                   force_local_processing: bool = False,
+                   prior_fingerprint: Optional[str] = None,
+                   content_hash_override: Optional[str] = None) -> bool:
+        """
+        Index a local file into the Vectara corpus.
+
+        Args:
+            filename (str): Path to the local file to index.
+            uri (str): Original URI the file was fetched from; used as the document ID and source URL.
+            metadata (dict): Metadata for the document.
+            id (str, optional): Override document id.
+            title_hint (str, optional): Title to use when the parser cannot infer one.
+            extra_image_urls (list, optional): Additional image URLs (e.g. from web extraction) to
+                summarize and append inline to the parent document. Used in the process_locally path
+                to include images that Docling may miss when they are nested inside <p>/<li> tags.
+                Only applied when inline_images=True and summarize_images=True.
+            force_local_processing (bool): Force the local parse path (Case B) regardless of the
+                per-file should_process_locally() heuristic. Callers use this when they already know
+                the file must be parsed locally — e.g. index_url routing a web page here to attach
+                binary image data, where the source URI has no file extension so the heuristic (which
+                keys off the URI) would otherwise send it down the raw file-upload path.
+
+        Returns:
+            bool: True if indexing was successful, False otherwise.
+        """
+        self.last_error = None
+        # Reset here too (index_url resets its own): index_file is called directly by the
+        # file/folder/s3/gdrive workers on a reused indexer, so a stale 'unchanged' from a
+        # previously-skipped file must not leak into the next file's outcome.
+        self.last_skip_reason = None
+        if not os.path.exists(filename):
+            self.last_error = f"file does not exist: {filename}"
+            logger.error(f"File {filename} does not exist")
+            return False
+
+        # Incremental reindexing: decide before any (expensive) parsing whether this document
+        # is unchanged. For local files we hash the raw bytes (covers embedded tables/images).
+        # Web callers (index_url) instead pass content_hash_override — the normalized page text —
+        # because the rendered HTML they hand us is non-deterministic per fetch and would defeat
+        # the skip. Skips here avoid Docling/OCR/LLM + upload entirely.
+        if self.incremental and 'fingerprint' not in metadata:
+            content_hash = content_hash_override if content_hash_override is not None else self._hash_file(filename)
+            if self._incremental_skip(content_hash, metadata, prior_fingerprint):
+                if self.verbose:
+                    logger.info(f"File {uri} unchanged (fingerprint match) — skipping")
+                return True
+
+        # Determine processing strategy
+        self._init_processors()
+        
+        # Per-call decision. The instance attribute (set from config) means
+        # "always process locally"; should_process_locally() means "this one
+        # file needs local processing." Must NOT be folded back into
+        # self.process_locally — that would poison every subsequent file
+        # (e.g. one image flips it True, then every later .txt/.md gets
+        # wrongly routed to Case B and fails with "File format not allowed").
+        process_locally = (
+            force_local_processing
+            or self.process_locally
+            or self.file_processor.should_process_locally(filename, uri)
+        )
+
+        #
+        # Case A: using the file-upload API
+        # Used when we don't need to process the file locally, and we don't need to parse tables from non-PDF files
+        #
+        if not process_locally and (
+                (self.parse_tables and filename.lower().endswith('.pdf')) or not self.parse_tables):
+            logger.info(f"For {uri} - Uploading via Vectara file upload API")
+            if len(self.extract_metadata) > 0 or self.summarize_images:
+                logger.info(f"Reading contents of {filename} (url={uri})")
+                dp = UnstructuredDocumentParser(
+                    cfg=self.cfg,
+                    verbose=self.verbose,
+                    model_config=self.cfg.doc_processing.model_config,
+                    parse_tables=False, enable_gmft=False,
+                    summarize_images=self.summarize_images,
+                    image_context=self.image_context,
+                )
+                parsed_doc = dp.parse(filename, uri)
+                title, texts, _, images = parsed_doc.to_legacy_format()
+
+            # Get metadata attribute values from text content (if defined)
+            ex_metadata = {}
+            if len(self.extract_metadata) > 0:
+                if 'text' not in self.model_config:
+                    logger.warning("Metadata field extraction is enabled but no text model is configured, skipping")
+                else:
+                    max_chars = 128000  # all_text is limited to 128,000 characters
+                    all_text = "\n".join([t[0] for t in texts])[:max_chars]
+                    ex_metadata = get_attributes_from_text(
+                        self.cfg,
+                        all_text,
+                        metadata_questions=self.extract_metadata,
+                        model_config=self.model_config.text
+                    )
+            metadata['file_name'] = os.path.basename(filename)
+            metadata.update(ex_metadata)
+
+            if self.file_processor.needs_pdf_splitting(filename):
+                # Split large PDF into smaller chunks
+                try:
+                    pdf_parts = self.file_processor.split_pdf(filename, metadata)
+                    error_count = 0
+                    
+                    for pdf_path, pdf_metadata, pdf_id in pdf_parts:
+                        # Tag each split part as a sub-doc of the original file so deletion
+                        # never removes a live part (its doc_id is never in the crawl's present
+                        # set, which is keyed on the original file).
+                        self.stamp_subdoc_metadata(pdf_metadata, id if id else slugify(uri))
+                        try:
+                            part_success = self._index_file(pdf_path, uri, pdf_metadata, pdf_id)
+                            if not part_success:
+                                error_count += 1
+                        finally:
+                            safe_file_cleanup(pdf_path)
+                            
+                    succeeded = error_count == 0
+                except Exception as e:
+                    logger.error(f"Failed to split PDF {filename}: {e}")
+                    self.last_error = f"split PDF failed: {e}"
+                    # Fallback: try to index the original file
+                    try:
+                        succeeded = self._index_file(filename, uri, metadata, id)
+                    except Exception as fallback_e:
+                        logger.error(f"Fallback indexing also failed for {filename}: {fallback_e}")
+                        self.last_error = f"fallback _index_file failed: {fallback_e}"
+                        succeeded = False
             else:
-                self.logger.info(f"For file {filename}, extracting text locally since file size is larger than {size_limit}MB")
+                # index the file within Vectara (use FILE UPLOAD API)
+                try:
+                    succeeded = self._index_file(filename, uri, metadata, id)
+                except Exception as e:
+                    logger.error(f"Failed to index file {filename} via Vectara API: {e}")
+                    self.last_error = f"_index_file failed: {e}"
+                    succeeded = False
+
+            # If indicated, summarize images - and upload each image summary as a single doc
+            if self.summarize_images and images:
+                logger.info(f"Extracted {len(images)} images from {uri}")
+                img_bytes_dict = self._build_image_bytes_dict(
+                    parsed_doc.image_bytes if hasattr(parsed_doc, 'image_bytes') else []
+                )
+                for inx, image in enumerate(images):
+                    image_summary = image[0]
+                    img_metadata = image[1]
+                    if ex_metadata:
+                        img_metadata.update(ex_metadata)
+                    doc_id = slugify(uri) + "_image_" + str(inx)
+                    self.stamp_subdoc_metadata(img_metadata, id if id else slugify(uri))
+
+                    # Pass only the single relevant image's bytes
+                    img_id = img_metadata.get('image_id')
+                    if self.add_image_bytes and img_id:
+                        img_data = img_bytes_dict.get(img_id)
+                        image_bytes_param = [(img_id, img_data)] if img_data else []
+                    else:
+                        image_bytes_param = []
+
+                    succeeded &= self.index_segments(
+                        doc_id=doc_id,
+                        texts=[image_summary],
+                        metadatas=[img_metadata],
+                        doc_metadata=metadata,
+                        doc_title=title,
+                        image_bytes=image_bytes_param,
+                        use_core_indexing=True
+                    )
             return succeeded
+
+        #
+        # Case B: Process locally and upload to Vectara
+        #
+
+        # Ensure file_name is in metadata (needed by split_pdf for part IDs)
+        if 'file_name' not in metadata:
+            metadata['file_name'] = os.path.basename(filename)
+
+        # Split large PDFs before local processing to avoid OOM
+        # Skip if already a split part (has start_page) to prevent infinite recursion
+        if 'start_page' not in metadata and self.file_processor.needs_pdf_splitting(filename):
+            logger.info(f"Large PDF detected, splitting before local processing: {filename}")
+            try:
+                pdf_parts = self.file_processor.split_pdf(filename, metadata)
+            except Exception as e:
+                logger.error(f"Failed to split PDF {filename}: {e}")
+                self.last_error = f"split PDF failed (local path): {e}"
+                return False
+            overall_success = True
+            for pdf_path, pdf_metadata, pdf_id in pdf_parts:
+                # Tag each split part as a sub-doc of the original file (see Case A above).
+                self.stamp_subdoc_metadata(pdf_metadata, id if id else slugify(uri))
+                try:
+                    part_success = self.index_file(pdf_path, uri, pdf_metadata, id=pdf_id, title_hint=title_hint)
+                    if not part_success:
+                        overall_success = False
+                finally:
+                    safe_file_cleanup(pdf_path)
+                    release_memory()
+            return overall_success
+
+        logger.info(f"Parsing file {filename} locally")
+
+        try:
+            parsed_doc = self.file_processor.process_file(filename, uri)
+        except Exception as e:
+            import traceback
+            logger.info(f"Failed to parse {filename} with error {e}, traceback={traceback.format_exc()}")
+            self.last_error = f"local parse failed: {e}"
+            return False
+
+        # Extract fields from parsed_doc, then release it early
+        content_stream = parsed_doc.content_stream
+        doc_title = parsed_doc.title or title_hint or ''
+        doc_tables = parsed_doc.tables
+        doc_image_bytes = parsed_doc.image_bytes
+        del parsed_doc
+
+        # Extract metadata from all text content
+        max_chars = 128000
+        all_text = "\n".join([content for content, metadata in content_stream
+                            if metadata.get('element_type') == 'text'])[:max_chars]
+        ex_metadata = self.file_processor.extract_metadata_from_text(all_text, metadata)
+        del all_text
+
+        # Apply contextual chunking to text elements if needed
+        if self.file_processor.contextual_chunking:
+            text_elements = [(content, metadata) for content, metadata in content_stream
+                           if metadata.get('element_type') == 'text']
+            processed_text_contents = self.file_processor.apply_contextual_chunking(text_elements, uri)
+            del text_elements
+
+            # Rebuild content stream with processed text
+            processed_content_stream = []
+            text_index = 0
+            for content, metadata in content_stream:
+                if metadata.get('element_type') == 'text':
+                    processed_content_stream.append((processed_text_contents[text_index], metadata))
+                    text_index += 1
+                else:
+                    processed_content_stream.append((content, metadata))
+            content_stream = processed_content_stream
+            del processed_text_contents, processed_content_stream
+
+        # Process tables
+        processed_tables = self.file_processor.generate_vec_tables(doc_tables)
+        del doc_tables
+
+        # Store image binary bits for later use
+        if doc_image_bytes and self.verbose:
+            logger.info(f"Document {filename} contains {len(doc_image_bytes)} images with binary data available")
+
+        # Check if images should be indexed inline or separately
+        if self.file_processor.inline_images:
+            # Index all content (text and images) in a single document
+            texts = [content for content, metadata in content_stream]
+            metadatas = [metadata for content, metadata in content_stream]
+            del content_stream
+
+            # Append summaries for images Docling missed (e.g. nested in <p>/<li> tags)
+            if extra_image_urls and self.summarize_images:
+                image_processor = ImageProcessor(
+                    cfg=self.cfg, model_config=self.model_config, verbose=self.verbose
+                )
+                processed_images, extra_img_bytes = image_processor.process_web_images(
+                    extra_image_urls, uri, {}
+                )
+                for _, image_summary, image_meta in processed_images:
+                    texts.append(image_summary)
+                    metadatas.append(image_meta)
+                if self.add_image_bytes:
+                    doc_image_bytes = (doc_image_bytes or []) + extra_img_bytes
+
+            # Force core indexing for standalone image files (short single summary text)
+            is_image_file = any(filename.lower().endswith(ext) for ext in IMG_EXTENSIONS)
+            use_core_for_indexing = (
+                is_image_file or
+                self.use_core_indexing or
+                self._is_chunking_enabled()
+            )
+
+            succeeded = self.index_segments(
+                doc_id=id if id else slugify(uri),
+                texts=texts,
+                metadatas=metadatas,
+                tables=processed_tables,
+                doc_metadata=metadata,
+                doc_title=doc_title,
+                image_bytes=doc_image_bytes,
+                use_core_indexing=use_core_for_indexing
+            )
         else:
-            # index the file within Vectara (use FILE UPLOAD API)
-            return self._index_file(filename, uri, metadata)
+            # Legacy mode: Index text in main document, images as separate documents
+            text_content = []
+            image_content = []
+            elements_without_type = []
+
+            for content, meta in content_stream:
+                element_type = meta.get('element_type')
+                if element_type == 'text':
+                    text_content.append((content, meta))
+                elif element_type == 'image':
+                    image_content.append((content, meta))
+                elif element_type is None:
+                    # Default to text if element_type is missing
+                    text_content.append((content, meta))
+                    elements_without_type.append(content[:50] + "..." if len(content) > 50 else content)
+                else:
+                    # Unknown element_type, default to text
+                    text_content.append((content, meta))
+                    logger.warning(f"Unknown element_type '{element_type}' found, treating as text")
+            del content_stream
+
+            if elements_without_type:
+                logger.warning(f"Found {len(elements_without_type)} content elements without element_type metadata, treating as text")
+
+            # Index text portions
+            texts = [content for content, meta in text_content]
+            metadatas = [meta for content, meta in text_content]
+
+            # Build image_bytes dict for efficient lookup in legacy per-image indexing
+            image_bytes_dict = self._build_image_bytes_dict(doc_image_bytes)
+
+            succeeded = self.index_segments(
+                doc_id=id if id else slugify(uri),
+                texts=texts,
+                metadatas=metadatas,
+                tables=processed_tables,
+                doc_metadata=metadata,
+                doc_title=doc_title,
+                image_bytes=doc_image_bytes,
+                use_core_indexing=self.use_core_indexing or self._is_chunking_enabled()
+            )
+
+            # Index images as separate documents
+            if image_content:
+                for idx, (image_summary, image_metadata) in enumerate(image_content):
+                    base_doc_id = id if id else slugify(uri)
+                    doc_id = f"{base_doc_id}_image_{idx}"
+                    image_metadata.update(ex_metadata)  # Add extracted metadata
+                    self.stamp_subdoc_metadata(image_metadata, base_doc_id)
+                    try:
+                        # Pass only the single relevant image's bytes (not entire list)
+                        img_id = image_metadata.get('image_id')
+                        if self.add_image_bytes and img_id:
+                            img_data = image_bytes_dict.get(img_id)
+                            image_bytes_param = [(img_id, img_data)] if img_data else []
+                        else:
+                            image_bytes_param = []
+
+                        img_okay = self.index_segments(
+                            doc_id=doc_id,
+                            texts=[image_summary],
+                            metadatas=[image_metadata],
+                            doc_metadata=image_metadata,
+                            doc_title=doc_title,
+                            image_bytes=image_bytes_param,
+                            use_core_indexing=True
+                        )
+                        succeeded &= img_okay
+                    except Exception as e:
+                        logger.info(f"Failed to index image {idx} with error {e}")
+                        succeeded = False
+
+        return succeeded
+
+    def index_media_file(self, file_path, metadata=None):
+        """
+        Index a media file (audio or video) by transcribing it with Whisper and uploading it to the Vectara corpus.
+
+        Args:
+            file_path (str): Path to the media file.
+            metadata (dict): Metadata for the document.
+
+        Returns:
+            bool: True if the upload was successful, False
+        """
+        logger.info(
+            f"Transcribing file {file_path} with Whisper model of size {self.whisper_model_name} (this may take a while)")
+        if self.whisper_model is None:
+            self.whisper_model = whisper.load_model(self.whisper_model_name, device="cpu")
+        result = self.whisper_model.transcribe(file_path, temperature=0, verbose=False)
+        text = result['segments']
+        doc = {
+            'id': slugify(file_path),
+            'title': file_path,
+            'sections': [
+                {
+                    'text': t['text'],
+                } for t in text
+            ]
+        }
+        if metadata:
+            doc['metadata'] = metadata
+        return self.index_document(doc)
+
+    def cleanup(self):
+        """Clean up resources used by the indexer"""
+        if self.web_extractor:
+            # Direct sync call since WebContentExtractor is now sync
+            self.web_extractor.cleanup()
+            self.web_extractor = None
+        # Release file_processor and its cached parsers / ML models
+        if self.file_processor:
+            self.file_processor.cleanup()
+            self.file_processor = None
+        # Close HTTP session to release connection pool memory
+        if hasattr(self, 'session') and self.session:
+            self.session.close()
+        # Clear caches
+        self._doc_exists_cache.clear()
+        
+    def _detect_image_mime_type(self, image_id: str = "", image_data: bytes = None) -> str:
+        """Detect MIME type for image data"""
+        if image_data:
+            # Check for common image headers
+            if image_data.startswith(b'\xff\xd8\xff'):
+                return "image/jpeg"
+            elif image_data.startswith(b'\x89PNG\r\n\x1a\n'):
+                return "image/png"
+            elif image_data.startswith(b'GIF87a') or image_data.startswith(b'GIF89a'):
+                return "image/gif"
+            elif image_data.startswith(b'\x00\x00\x01\x00') or image_data.startswith(b'\x00\x00\x02\x00'):
+                return "image/x-icon"
+        
+        # Fallback to guessing from image_id/filename
+        if image_id:
+            mime_type, _ = mimetypes.guess_type(image_id)
+            if mime_type and mime_type.startswith('image/'):
+                return mime_type
+        
+        # Default fallback
+        return "image/png"
     
+    @staticmethod
+    def _build_image_bytes_dict(image_bytes: List[Tuple[str, bytes]]) -> Dict[str, bytes]:
+        """Build a dict from image_bytes list for O(1) lookup by image_id."""
+        if not image_bytes:
+            return {}
+        return {stored_id: binary_data for stored_id, binary_data in image_bytes}
+
+    def _find_image_binary_data(self, image_id: str, image_bytes_dict: Dict[str, bytes]) -> Optional[bytes]:
+        """Find binary data for a given image ID using pre-built dict."""
+        if not image_bytes_dict or not image_id:
+            return None
+
+        # O(1) exact match
+        result = image_bytes_dict.get(image_id)
+        if result is not None:
+            return result
+
+        # Partial match fallback (useful for web images)
+        for stored_id, binary_data in image_bytes_dict.items():
+            if image_id in stored_id or stored_id in image_id:
+                return binary_data
+
+        return None

@@ -1,12 +1,112 @@
 vectara:
-  corpus_id: 277
-  customer_id: 1526022105
+  corpus_key: gdrive
   reindex: true
+  create_corpus: false
 
 crawling:
   crawler_type: gdrive
 
 gdrive_crawler:
+  # Use service account authentication with domain-wide delegation
+  auth_type: service_account
+
+  # List of users to crawl files for (only used with service_account auth_type)
+  # For OAuth mode, this field is not required
   delegated_users:
     - <add email id>
     - <add email id>
+
+  # Path to service account credentials file
+  # This should contain the service account JSON from Google Cloud Console
+  # For OAuth mode, use vectara-gdrive-oauth.yaml instead
+  credentials_file: /path/to/credentials.json
+
+  # Days back to crawl (files modified in last N days)
+  # Default: 7 days if not specified
+  days_back: 7
+
+  # Optional: restrict the crawl to one or more subtrees. Accepts either a
+  # single Drive folder URL/id or a list of them, so a config can mix a
+  # My-Drive folder with a Shared Drive id in one run. When unset, the
+  # crawler sweeps root, sharedWithMe, and files owned/shared with the user,
+  # as before. Shortcuts inside a subtree are not followed, so the crawl
+  # stays strictly within the chosen folders. `days_back` still applies to
+  # files; subfolders are always traversed so old folders containing recent
+  # files are not missed. A file reachable from more than one configured
+  # root is indexed once.
+  #
+  # Single-folder form (legacy, still supported):
+  # root_folder: https://drive.google.com/drive/folders/1Z5X4D5DFIeo-xEThXTkN0V4tL96EqORQ
+  #
+  # Multi-folder form (My Drive subtree + a Shared Drive):
+  # root_folder:
+  #   - https://drive.google.com/drive/folders/1Z5X4D5DFIeo-xEThXTkN0V4tL96EqORQ
+  #   - 0AJb-TGGUWsU4Uk9PVA
+
+  # Crawl-time displayName gate. Only files whose permissions contain a display
+  # name from this list are indexed. Set to null or [] to disable the gate and
+  # rely solely on ABAC metadata + query-time filters.
+  # Default: ['Vectara', 'all']. The legacy key `permissions` is still honored
+  # but deprecated.
+  permission_display_filter:
+    - Vectara
+    - all
+
+  # Attribute-based access control (ABAC) metadata
+  #
+  # When enabled, each indexed document is tagged with filterable ACL fields:
+  #   acl_owners, acl_readers, acl_groups, acl_domains, acl_is_public,
+  #   acl_is_org_wide, acl_labels, acl_source
+  #
+  # The corpus admin must register these as filter attributes on the Vectara
+  # corpus before ABAC filter queries will work. List-valued fields
+  # (acl_owners, acl_readers, acl_groups, acl_domains, acl_labels) should be
+  # registered as `Text List` so membership filters (`'x' IN doc.field`) work.
+  #
+  # Group resolution is the query layer's responsibility. The crawler records
+  # the literal group emails granted on the file in `acl_groups`. At query
+  # time, look up the requesting user's **transitive** group membership (e.g.
+  # via Admin SDK `groups.list(userKey=email)` or `members.hasMember` with
+  # nested-group expansion) and OR each group into the filter against
+  # `acl_groups`. This avoids stale-membership leaks the crawler-side
+  # expansion would otherwise cause on group removal.
+  abac:
+    # Emit acl_* metadata on every indexed document.
+    enabled: false
+
+    # My Drive files don't receive inherited permissions via the API. When true,
+    # the crawler walks each file's parent folders and unions their ACLs.
+    # Adds API round-trips; folder lookups are cached per worker.
+    #
+    # Shared Drive files take a separate, unconditional path: Drive's File
+    # resource does not populate `permissions` for shared-drive items, so the
+    # crawler reads each file's ACL with `permissions.list(fileId=<fileId>)` —
+    # one call per shared-drive file, not cached. That returns the complete
+    # effective ACL: direct file grants plus those inherited from parent folders
+    # and drive membership, including group grants. The drive-root membership is
+    # also fetched once per drive (`permissions.list(fileId=<driveId>)`, cached
+    # per worker) and unioned in as a backup. ACL resolution is therefore
+    # O(shared-drive files), not O(drives). These calls need the delegated user
+    # to have at least `fileOrganizer` on the drive; a 403 on either still
+    # indexes the file but tags it `acl_source: shared_drive_partial`.
+    resolve_inherited: false
+
+    # Treat `type=anyone` grants as public (sets acl_is_public=true).
+    include_anyone: true
+
+    # Fetch Drive Labels per file and store them as `<LabelTitle>=<Value>`
+    # strings in acl_labels. Adds one round-trip per file, plus one
+    # definitions fetch per worker. Requires the `drive.labels.readonly` scope.
+    fetch_labels: false
+
+    # Issue the Shared Drive permissions.list calls (both the per-file listings
+    # and the drive-root membership listing) with useDomainAdminAccess=true. Use
+    # this when the delegated user is a Workspace domain admin but is not a
+    # fileOrganizer/organizer on the shared drives being crawled — without it
+    # those listings 403 and files are tagged acl_source: shared_drive_partial
+    # (empty acl_groups). Default: false.
+    shared_drive_admin_access: false
+
+  # Optional: Ray workers for parallel processing (default: 0)
+  # 0 = no parallelization, >0 = number of workers
+  ray_workers: 0

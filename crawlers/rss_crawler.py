@@ -1,11 +1,82 @@
 import logging
+logger = logging.getLogger(__name__)
 import time
+import ray
+import psutil
 from core.crawler import Crawler
+from core.indexer import Indexer
+from core.indexer_utils import normalize_url_for_metadata
+from core.incremental import build_manifest, plan_deletions, prefilter_unchanged
+from core.utils import setup_logging
+from crawlers.rss_feed_utils import extract_feed_entries
 import feedparser
 from datetime import datetime, timedelta
 from time import mktime
+from omegaconf import DictConfig
+
+class RssUrlWorker(object):
+    def __init__(self, cfg: DictConfig, indexer: Indexer, source: str, prior_fingerprints: dict = None):
+        self.indexer = indexer
+        self.cfg = cfg
+        self.source = source
+        # {normalized_url: fingerprint} from the prior corpus state; lets index_url skip an
+        # unchanged entry after fetching. Empty unless incremental is enabled.
+        self.prior_fingerprints = prior_fingerprints or {}
+
+    def setup(self):
+        self.indexer.setup()
+        setup_logging()
+    
+    def cleanup(self):
+        """Cleanup resources when worker is done"""
+        if hasattr(self, 'indexer'):
+            self.indexer.cleanup()
+
+    def process(self, url_data: tuple):
+        url, title, pub_date = url_data
+        try:
+            # index document into Vectara
+            if pub_date:
+                pub_date_int = int(str(pub_date.timestamp()).split('.')[0])
+            else:
+                pub_date_int = 0        # unknown published date
+                pub_date = 'unknown'
+            
+            today = datetime.now().replace(microsecond=0)
+            crawl_date_int = int(str(today.timestamp()).split('.')[0])
+            metadata = {
+                'source': self.source, 'url': url, 'title': title,
+                'pub_date': str(pub_date), 'pub_date_int': pub_date_int,
+                'crawl_date': str(today),
+                'crawl_date_int': crawl_date_int
+            }
+            prior_fingerprint = self.prior_fingerprints.get(normalize_url_for_metadata(url))
+            succeeded = self.indexer.index_url(url, metadata=metadata, prior_fingerprint=prior_fingerprint)
+            if succeeded:
+                logger.info(f"Successfully indexed {url}")
+                return 1
+            else:
+                logger.info(f"Indexing failed for {url}")
+                return 0
+        except Exception as e:
+            logger.error(f"Error while indexing {url}: {e}")
+            return -1
 
 class RssCrawler(Crawler):
+    
+    def __init__(self, cfg, *args, **kwargs):
+        super().__init__(cfg, *args, **kwargs)
+        # Incremental reindexing state (see core/incremental.py).
+        self.incremental = self.cfg.rss_crawler.get("incremental", False)
+        # Get scrape_method from rss_crawler config if available
+        scrape_method = self.cfg.rss_crawler.get('scrape_method')
+        if scrape_method:
+            # Recreate indexer with the scrape_method
+            from core.indexer import Indexer
+            endpoint = args[0] if args else kwargs.get('endpoint')
+            corpus_key = args[1] if len(args) > 1 else kwargs.get('corpus_key')
+            api_key = args[2] if len(args) > 2 else kwargs.get('api_key')
+            self.indexer = Indexer(cfg, endpoint, corpus_key, api_key, scrape_method=scrape_method)
 
     def crawl(self) -> None:
         """
@@ -16,89 +87,130 @@ class RssCrawler(Crawler):
         if isinstance(rss_pages, str):
             rss_pages = [rss_pages]
         delay_in_secs = self.cfg.rss_crawler.delay
-        days_past = self.cfg.rss_crawler.days_past
-
+        ray_workers = self.cfg.rss_crawler.get("ray_workers", 0)
         today = datetime.now().replace(microsecond=0)
-        cutoff_date = today - timedelta(days=days_past)
+        days_ago = today - timedelta(days=self.cfg.rss_crawler.days_past)
 
-        logging.info(f"Starting RSS crawl for the last {days_past} days from source: {source}")
-
-        # Collect all URLs from the RSS feeds
+        # Preserve the fork's malformed-feed/entry safeguards while using the
+        # upstream incremental indexing and URL deduplication pipeline.
         urls = []
         for rss_page in rss_pages:
-            logging.debug(f"Parsing RSS feed: {rss_page}")
             try:
                 feed = feedparser.parse(rss_page)
-                if feed.bozo:
-                    logging.warning(f"Malformed RSS feed detected: {rss_page}")
-                for entry in feed.entries:
-                    try:
-                        entry_link = getattr(entry, 'link', None)
-                        entry_title = getattr(entry, 'title', "No Title")
-                        entry_published_parsed = getattr(entry, 'published_parsed', None)
-
-                        if not entry_link:
-                            logging.warning(f"Entry missing 'link' attribute in feed {rss_page}. Skipping entry: {entry}")
-                            continue
-
-                        if entry_published_parsed:
-                            entry_date = datetime.fromtimestamp(mktime(entry_published_parsed))
-                        else:
-                            logging.warning(f"Entry missing 'published' date in feed {rss_page}. Using current time as publish date.")
-                            entry_date = datetime.now()
-
-                        if cutoff_date <= entry_date <= today:
-                            urls.append([entry_link, entry_title, entry_date])
-                            logging.debug(f"Added URL: {entry_link}, Title: {entry_title}, Date: {entry_date}")
-                        else:
-                            logging.debug(f"Skipping URL: {entry_link}, Date: {entry_date} outside the cutoff range.")
-
-                    except Exception as e:
-                        logging.error(f"Error processing entry in feed {rss_page}: {e}")
-            except Exception as e:
-                logging.error(f"Error parsing RSS feed {rss_page}: {e}")
-
-        logging.info(f"Found {len(urls)} URLs to index from the last {days_past} days ({source})")
-
-        crawled_urls = set()  # To avoid duplications
-        for url, title, pub_date in urls:
-            if url in crawled_urls:
-                logging.info(f"Skipping duplicate URL: {url}")
+            except Exception:
+                logger.exception("Unable to parse RSS feed %s", rss_page)
                 continue
+            urls.extend(extract_feed_entries(feed, rss_page, days_ago, today))
 
-            # Index document into Vectara
-            try:
-                if pub_date:
-                    pub_date_int = int(pub_date.timestamp())
-                else:
-                    pub_date_int = 0  # Unknown published date
-                    pub_date = 'unknown'
+        # Remove duplicates while preserving order
+        unique_urls = []
+        seen_urls = set()
+        for url, title, pub_date in urls:
+            if url not in seen_urls:
+                unique_urls.append((url, title, pub_date))
+                seen_urls.add(url)
+            else:
+                logger.debug(f"Skipping duplicate URL {url}")
+        logger.info(f"After deduplication, we have found {len(unique_urls)} URLs to index from the last {self.cfg.rss_crawler.days_past} days ({source})")
 
-                crawl_date_int = int(today.timestamp())
+        # Incremental reindexing: build the corpus manifest once, source-scoped, then use it
+        # for a Layer-1 pre-fetch skip (pub_date not newer than what we last indexed) and to
+        # pass prior fingerprints to the workers (Layer-2 post-fetch skip).
+        remove_old_content = self.cfg.rss_crawler.get("remove_old_content", False)
+        manifest = {}
+        prior_fingerprints = {}
+        # Every feed entry in the window is "present at source" for the deletion diff.
+        present_keys = {normalize_url_for_metadata(u) for u, _t, _p in unique_urls}
+        if self.incremental or remove_old_content:
+            manifest = build_manifest(self.indexer, key="url",
+                                      source=(self.indexer.source_tag if self.incremental else None))
+            logger.info(f"Loaded corpus manifest: {len(manifest)} existing documents")
+        if self.incremental and manifest:
+            prior_fingerprints = {k: e.fingerprint for k, e in manifest.items() if e.fingerprint}
+            kept = []
+            skipped = 0
+            for url, title, pub_date in unique_urls:
+                entry = manifest.get(normalize_url_for_metadata(url))
+                # Compare the feed pub_date against the pub_date we stored last run — the same
+                # clock. (Not entry.last_updated, which index_url derives from the page HTML: a
+                # different clock that can read newer than the feed and wrongly skip a real
+                # update.) Fails safe to "fetch" when either side is missing, and is gated on
+                # the stored config_sig so a processing-config change re-indexes entries whose
+                # pub_date is unchanged.
+                if prefilter_unchanged(entry, pub_date, "pub_date", self.indexer.config_sig):
+                    skipped += 1
+                    continue
+                kept.append((url, title, pub_date))
+            unique_urls = kept
+            if skipped:
+                logger.info(f"Incremental: skipped {skipped} unchanged entries via pub_date "
+                            f"({len(unique_urls)} remaining to index)")
 
-                metadata = {
-                    'source': source,
-                    'url': url,
-                    'title': title,
-                    'pub_date': str(pub_date),
-                    'pub_date_int': pub_date_int,
-                    'crawl_date': str(today),
-                    'crawl_date_int': crawl_date_int
-                }
+        if ray_workers == -1:
+            ray_workers = psutil.cpu_count(logical=True)
 
-                logging.debug(f"Indexing URL: {url} with metadata: {metadata}")
-                succeeded = self.indexer.index_url(url, metadata=metadata)
-                if succeeded:
-                    logging.info(f"Successfully indexed {url}")
-                    crawled_urls.add(url)
-                else:
-                    logging.warning(f"Indexing failed for {url}")
+        crawl_completed = False
+        try:
+            if ray_workers > 0:
+                logger.info(f"Using {ray_workers} ray workers to process {len(unique_urls)} URLs")
+                # Disable browser for parallel processing
+                self.indexer.p = self.indexer.browser = None
+                ray.init(num_cpus=ray_workers, log_to_driver=True, include_dashboard=False)
+                # Broadcast the fingerprint map once via the object store (zero-copied per node)
+                # rather than serializing the full dict into every actor.
+                pf_ref = ray.put(prior_fingerprints)
+                actors = [
+                    ray.remote(RssUrlWorker).remote(self.cfg, self.indexer, source, pf_ref)
+                    for _ in range(ray_workers)
+                ]
+                for a in actors:
+                    a.setup.remote()
+                pool = ray.util.ActorPool(actors)
+                results = list(pool.map(lambda a, u: a.process.remote(u), unique_urls))
 
-            except Exception as e:
-                logging.error(f"Error while indexing {url}: {e}")
+                # Log summary
+                successful = sum(1 for r in results if r == 1)
+                failed = sum(1 for r in results if r == 0)
+                errors = sum(1 for r in results if r == -1)
+                logger.info(f"RSS crawling complete: {successful} successful, {failed} failed, {errors} errors")
 
-            time.sleep(delay_in_secs)
+                # Cleanup Ray workers
+                for a in actors:
+                    ray.get(a.cleanup.remote())
+            else:
+                # Sequential processing (original behavior)
+                rss_worker = RssUrlWorker(self.cfg, self.indexer, source, prior_fingerprints)
+                rss_worker.setup()
+                successful = 0
+                for inx, url_data in enumerate(unique_urls):
+                    if (inx + 1) % 10 == 0:
+                        logger.info(f"Processing URL {inx+1} out of {len(unique_urls)}")
+                    result = rss_worker.process(url_data)
+                    if result == 1:
+                        successful += 1
+                    if delay_in_secs > 0:
+                        time.sleep(delay_in_secs)
+                # Cleanup worker
+                rss_worker.cleanup()
+                logger.info(f"RSS crawling complete: {successful} URLs successfully indexed")
+            crawl_completed = True
+        finally:
+            # Always release Ray, even if a worker task raised mid-crawl — otherwise the
+            # cluster and its worker processes leak into subsequent runs.
+            if ray_workers > 0:
+                ray.shutdown()
 
-        logging.info("RSS crawl completed successfully.")
+        # Delete corpus docs not present in the current feed window — opt-in via
+        # remove_old_content (NOT auto-enabled by incremental). Note: RSS only sees the last
+        # `days_past` days, so this removes any corpus doc older than the window. Enable it only
+        # if you want the corpus to mirror the current feed rather than accumulate history.
+        if remove_old_content:
+            listing_complete = crawl_completed and len(present_keys) > 0
+            ratio = self.cfg.rss_crawler.get("deletion_safety_ratio", 0.5)
+            to_delete, refused = plan_deletions(manifest, present_keys, listing_complete, ratio)
+            if not refused:
+                deleted = sum(1 for doc_id in to_delete if self.indexer.delete_doc(doc_id))
+                logger.info(f"Removed {deleted} of {len(to_delete)} docs that are no longer "
+                            f"present in the RSS feeds.")
+
         return
-

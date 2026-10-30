@@ -1,13 +1,15 @@
 import logging
+logger = logging.getLogger(__name__)
 from core.crawler import Crawler
 import arxiv
-from core.utils import create_session_with_retries
+from core.utils import create_session_with_retries, configure_session_for_ssl
+
 
 def validate_category(category: str) -> bool:
     valid_categories = [
         "cs", "econ", "q-fin","stat",
         "math", "math-ph", "q-bio", "stat-mech",
-        "physics", "astro-ph", "cond-mat", "gr-qc", "hep-ex", "hep-lat", "hep-ph", 
+        "physics", "astro-ph", "cond-mat", "gr-qc", "hep-ex", "hep-lat", "hep-ph",
         "hep-th", "nucl-ex", "nucl-th", "physics-ao-ph", "physics-ao-pl", "physics-ao-po",
         "physics-ao-ps", "physics-app-ph",
         "quant-ph"
@@ -15,6 +17,18 @@ def validate_category(category: str) -> bool:
     return category in valid_categories
 
 class ArxivCrawler(Crawler):
+    
+    def __init__(self, cfg, *args, **kwargs):
+        super().__init__(cfg, *args, **kwargs)
+        # Get scrape_method from arxiv_crawler config if available
+        scrape_method = self.cfg.arxiv_crawler.get('scrape_method')
+        if scrape_method:
+            # Recreate indexer with the scrape_method
+            from core.indexer import Indexer
+            endpoint = args[0] if args else kwargs.get('endpoint')
+            corpus_key = args[1] if len(args) > 1 else kwargs.get('corpus_key')
+            api_key = args[2] if len(args) > 2 else kwargs.get('api_key')
+            self.indexer = Indexer(cfg, endpoint, corpus_key, api_key, scrape_method=scrape_method)
 
     def get_citations(self, arxiv_id: str) -> int:
         """
@@ -35,20 +49,20 @@ class ArxivCrawler(Crawler):
             if response.status_code != 200:
                 return -1
             paper_info = response.json()
-        
+
             paper_id = paper_info.get('paperId')
             base_url = "https://api.semanticscholar.org/v1/paper/"
             response = self.session.get(base_url + paper_id)
 
             if response.status_code == 200:
                 paper_info = response.json()
-                n_citations = len(paper_info.get("citations"))
+                n_citations = len(paper_info.get("citations", []))
                 return n_citations
             else:
                 return -1
 
         except Exception as e:
-            logging.info(f"Error parsing response from arxiv API: {e}, response={response.text}")
+            logger.warning(f"Error parsing response from arxiv API: {e}")
             return -1
 
 
@@ -58,11 +72,12 @@ class ArxivCrawler(Crawler):
         year = self.cfg.arxiv_crawler.start_year
         category = self.cfg.arxiv_crawler.arxiv_category
         if not validate_category(category):
-            logging.info(f"Invalid arxiv category: {category}, please check the config file")
+            logger.warning(f"Invalid arxiv category: {category}, please check the config file")
             exit(1)
 
         # setup requests session and mount adapter to retry requests
         self.session = create_session_with_retries()
+        configure_session_for_ssl(self.session, self.cfg.arxiv_crawler)
 
         # define query for arxiv: search for the query in the "computer science" (cs.*) category
         query = f"cat:{category}.* AND " + ' AND '.join([f'all:{q}' for q in query_terms])
@@ -78,14 +93,15 @@ class ArxivCrawler(Crawler):
             search = arxiv.Search(
                 query = query,
                 max_results = n_papers,
-                sort_by = arxiv.SortCriterion.submittedDate,
+                sort_by = arxiv.SortCriterion.SubmittedDate,
                 sort_order = arxiv.SortOrder.Descending
             )
 
         # filter by publication year
         papers = []
+        client = arxiv.Client()
         try:
-            for result in search.results():
+            for result in client.results(search):
                 date = result.published.date()
                 if date.year < year:
                     continue
@@ -100,10 +116,13 @@ class ArxivCrawler(Crawler):
                     'published': str(date)
                 })
         except Exception as e:
-            logging.info(f"Exception {e}, we have {len(papers)} papers already, so will continue with indexing")
+            if not papers:
+                logger.error(f"arxiv query failed before returning any results: {e}", exc_info=True)
+                raise
+            logger.warning(f"Exception {e}, we have {len(papers)} papers already, so will continue with indexing")
 
         if len(papers) == 0:
-            logging.info(f"Found 0 papers for query: {query}, ignore crawl")
+            logger.info(f"Found 0 papers for query: {query}, ignore crawl")
             return
 
         # sort by citation count and get top n papers

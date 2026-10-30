@@ -1,0 +1,478 @@
+import logging
+import os
+import pandas as pd
+from typing import List, Optional, Dict, Tuple, Iterator
+from omegaconf import DictConfig
+from core.summary import TableSummarizer
+from core.utils import html_table_to_header_and_rows
+from core.indexer import Indexer
+import unicodedata
+
+logger = logging.getLogger(__name__)
+
+
+# Custom exception classes
+class DataFrameParserError(Exception):
+    """Base exception for DataFrame parser errors"""
+    pass
+
+
+class InvalidFileError(DataFrameParserError):
+    """Raised when file is invalid or inaccessible"""
+    pass
+
+
+class InvalidConfigurationError(DataFrameParserError):
+    """Raised when configuration is invalid"""
+    pass
+
+
+separator_by_extension: Dict[str, str] = {".csv": ",", ".tsv": "	", ".psv": "|", ".pipe": "|"}
+supported_dataframe_extensions: Dict[str, str] = {
+    ".csv": "csv",
+    ".tsv": "csv",
+    ".xls": "xls",
+    ".xlsx": "xls",
+    ".pipe": "csv",
+    ".psv": "csv",
+}
+
+
+def generate_dfs_to_index(df: pd.DataFrame, doc_id_columns: Optional[List[str]], rows_per_chunk: int) -> Iterator[Tuple[str, pd.DataFrame]]:
+    """
+    Generates dataframes to be indexed based on the provided DataFrame, document ID columns,
+    and the desired number of rows per chunk.
+
+    Args:
+        df: The input pandas DataFrame.
+        doc_id_columns: A list of column names to use for grouping and generating document IDs.
+                        If None or empty, the DataFrame will be chunked by `rows_per_chunk`.
+        rows_per_chunk: The maximum number of rows in each chunk when `doc_id_columns` is not provided.
+
+    Yields:
+        A tuple containing the generated document ID and the corresponding DataFrame chunk.
+        
+    Raises:
+        InvalidConfigurationError: If rows_per_chunk is not positive or doc_id_columns don't exist.
+    """
+    # Validate inputs
+    if df.empty:
+        logger.warning("Empty DataFrame provided to generate_dfs_to_index")
+        return
+    
+    if rows_per_chunk <= 0:
+        raise InvalidConfigurationError(f"rows_per_chunk must be positive, got {rows_per_chunk}")
+    
+    if doc_id_columns:
+        # Validate that all doc_id_columns exist in the DataFrame
+        missing_cols = [col for col in doc_id_columns if col not in df.columns]
+        if missing_cols:
+            raise InvalidConfigurationError(f"doc_id_columns {missing_cols} not found in DataFrame columns: {list(df.columns)}")
+    
+    if doc_id_columns:
+        grouped = df.groupby(doc_id_columns)
+        for name, group in grouped:
+            if isinstance(name, str):
+                doc_id = name
+            else:
+                doc_id = " - ".join([str(x) for x in name if x])
+            yield (doc_id, group)
+    else:
+        if rows_per_chunk > len(df):
+            rows_per_chunk = len(df)
+        for inx in range(0, df.shape[0], rows_per_chunk):
+            sub_df = df[inx: inx+rows_per_chunk]
+            if rows_per_chunk > 1:
+                name = f'rows {inx}-{inx+rows_per_chunk-1}'
+            else:
+                name = f'row {inx}'
+            yield (name, sub_df)
+
+
+def get_separator_by_file_name(file_name: str) -> str:
+    """
+    Determines the appropriate separator character based on the file extension.
+
+    Args:
+        file_name: The name of the file.
+
+    Returns:
+        The separator character for the given file extension, defaulting to ',' if the extension is unknown.
+    """
+    _, extension = os.path.splitext(file_name)
+    extension = extension.lower()
+    if extension in separator_by_extension:
+        return separator_by_extension[extension]
+    else:
+        logger.warning(
+            f"get_separator_by_file_name(file_name = '{file_name}') - Unknown extension '{extension}' defaulting to ','"
+        )
+        return ","
+
+
+def open_excel_with_fallback(file_path: str) -> pd.ExcelFile:
+    """Open an Excel file with pandas' default engine, falling back to ``calamine``
+    on failure.
+
+    For ``.xlsx`` the default engine is openpyxl, which parses ``xl/styles.xml``
+    during workbook load. Files written by some non-Excel tools have malformed
+    style elements that openpyxl rejects outright (e.g.
+    ``expected <class 'openpyxl.styles.fills.Fill'>``), making the file
+    unreadable even though its cell values are intact. openpyxl exposes no flag
+    to skip style parsing, so the only dependable rescue is a different reader.
+    ``calamine`` (Rust, via ``python-calamine``) reads values only — no style
+    parsing — and content-sniffs the format, so it succeeds where openpyxl
+    fails and also tolerates mislabeled files. The fallback only triggers when
+    the default engine raises, so currently-working files are unchanged.
+    """
+    try:
+        return pd.ExcelFile(file_path)
+    except OSError:
+        # Missing file / permission / not-a-file: not an engine problem,
+        # so calamine cannot help — surface the real error.
+        raise
+    except Exception as e:
+        logger.warning(
+            f"Default Excel engine failed for {file_path} "
+            f"({type(e).__name__}: {e}); retrying with engine='calamine'"
+        )
+        return pd.ExcelFile(file_path, engine="calamine")
+
+
+def supported_by_dataframe_parser(file_path: str) -> bool:
+    """
+    Checks if the file extension of the given file path is supported for dataframe parsing.
+
+    Args:
+        file_path: The path to the file.
+
+    Returns:
+        True if the file extension is supported, False otherwise.
+    """
+    _, extension = os.path.splitext(file_path)
+    return extension.lower() in supported_dataframe_extensions
+
+
+def determine_dataframe_type(file_path: str) -> Optional[str]:
+    """
+    Determines the type of the dataframe based on the file extension.
+
+    Args:
+        file_path: The path to the file.
+
+    Returns: The dataframe type ('csv' or 'xls') if supported, None otherwise.
+    
+    Raises:
+        InvalidFileError: If file_path is empty or invalid.
+    """
+    if not file_path or not file_path.strip():
+        raise InvalidFileError("file_path cannot be empty")
+    
+    logger.debug(
+        f"determine_dataframe_type('{file_path}') - determining dataframe type."
+    )
+    _, extension = os.path.splitext(file_path)
+    extension = extension.lower()
+
+    if extension in supported_dataframe_extensions:
+        return supported_dataframe_extensions[extension]
+    else:
+        logger.warning(
+            f"determine_dataframe_type('{file_path}') - Extension '{extension}' not supported."
+        )
+        return None
+
+
+class DataframeParser:
+    """
+    Parses dataframes and indexes their content based on the configured mode ('table' or 'element').
+    """
+
+    def __init__(
+        self,
+        cfg: DictConfig,
+        crawler_config: DictConfig,
+        indexer: Indexer,
+        table_summarizer: TableSummarizer,
+    ):
+        self.cfg: DictConfig = cfg
+
+        if crawler_config is None:
+            logger.debug("crawler_config is none, defaulting to dataframe_processing.")
+            self.crawler_config: DictConfig = cfg.dataframe_processing
+        else:
+            self.crawler_config: DictConfig = crawler_config
+        self.truncate_table_if_over_max: bool = self.crawler_config.get("truncate_table_if_over_max", True)
+        self.max_rows: int = int(self.crawler_config.get("max_rows", 500))
+        self.max_cols: int = int(self.crawler_config.get("max_cols", 20))
+        self.mode: str = self.crawler_config.get("mode", "table")
+        self.indexer: Indexer = indexer
+        self.table_summarizer: TableSummarizer = table_summarizer
+        self.select_condition = self.crawler_config.get("select_condition", None)
+        # Diagnostic: reason for most recent process_dataframe_file() failure
+        # (set by the free function below). Callers should read this immediately
+        # after a False return to enrich drop/error records.
+        self.last_error: Optional[str] = None
+
+    def process_dataframe(self, df: pd.DataFrame, doc_id: str, doc_title: str, metadata: dict,
+                          prior_fingerprints: dict = None, content_hash_override: str = None):
+        """
+        Primary entry point. Receives a single DataFrame and processes it
+        based on the configured mode.
+
+        prior_fingerprints / content_hash_override carry incremental-reindex state: the per
+        doc_id prior fingerprint map (the table summary is LLM-generated and not stable across
+        runs, so the skip must key off content_hash_override — e.g. Drive modifiedTime — not the
+        section text). Empty/None for crawlers that don't run incremental.
+        """
+        # Apply column type conversions if specified
+        column_types = self.crawler_config.get("column_types", None)
+        if column_types:
+            for col, dtype in column_types.items():
+                if col in df.columns:
+                    try:
+                        df[col] = df[col].astype(dtype)
+                    except Exception as e:
+                        logger.warning(f"Could not convert column {col} to {dtype}: {e}")
+
+        if self.select_condition:
+            logger.info(f"Querying dataframe with {self.select_condition}")
+            df = df.query(self.select_condition)
+
+        if self.mode == "table":
+            self._parse_as_table(df, doc_id, doc_title, metadata, prior_fingerprints, content_hash_override)
+        elif self.mode == "element":
+            self._parse_as_elements(df, doc_id, doc_title, metadata, prior_fingerprints, content_hash_override)
+
+    def _summarize_table(self, df: pd.DataFrame, name: str) -> Optional[Tuple[str, dict]]:
+        """
+        Summarizes a dataframe and prepares it for indexing.
+        """
+        if self.truncate_table_if_over_max:
+            if df.shape[0] > self.max_rows or df.shape[1] > self.max_cols:
+                logger.warning(
+                    f"Table size is too large for {name} in 'table' mode. "
+                    f"Table will be truncated to no more than {self.max_rows} rows and {self.max_cols} columns."
+                )
+                df = df.iloc[: self.max_rows, : self.max_cols]
+
+        table_summary = self.table_summarizer.summarize_table_text(df)
+        if table_summary:
+            cols, rows = html_table_to_header_and_rows(df.to_html(index=False))
+            cols_not_empty = any(col for col in cols)
+            rows_not_empty = any(any(cell for cell in row) for row in rows)
+            logger.info(
+                f"Table '{name}' has {len(cols)} columns and {len(rows)} rows. Summary: {table_summary}"
+            )
+            if rows_not_empty and cols_not_empty:
+                table_dict = {"headers": cols, "rows": rows, "summary": table_summary}
+                return table_summary, table_dict
+            else:
+                return None
+        else:
+            logger.warning(
+                f"Table summarization failed for the table with {df.shape[0]} rows and {df.shape[1]} columns."
+            )
+            return None
+
+    def _parse_as_table(self, df: pd.DataFrame, doc_id: str, doc_title: str, metadata: dict,
+                        prior_fingerprints: dict = None, content_hash_override: str = None):
+        """
+        Handles 'table' mode logic for a single DataFrame.
+        """
+        summarize_result = self._summarize_table(df, doc_title)
+        if summarize_result:
+            table_summary, table_dict = summarize_result
+            self.indexer.index_segments(
+                doc_id=doc_id,
+                doc_title=doc_title,
+                doc_metadata=metadata,
+                tables=[table_dict],
+                texts=[table_summary],
+                prior_fingerprint=(prior_fingerprints or {}).get(doc_id),
+                content_hash_override=content_hash_override,
+            )
+
+    def _parse_as_elements(self, df: pd.DataFrame, doc_id_prefix: str, doc_title: str, metadata: dict,
+                           prior_fingerprints: dict = None, content_hash_override: str = None):
+        """
+        Handles 'element' mode logic for a single DataFrame.
+        """
+        doc_id_columns = self.crawler_config.get("doc_id_columns", [])
+        if doc_id_columns:
+            doc_id_columns = list(doc_id_columns)
+        rows_per_chunk = self.crawler_config.get("rows_per_chunk", 500)
+
+        for chunk_id, child_df in generate_dfs_to_index(df, doc_id_columns, rows_per_chunk):
+            final_doc_id = f"{doc_id_prefix}-{chunk_id}" if doc_id_columns else doc_id_prefix
+            self._process_element_chunk(child_df, final_doc_id, doc_title, metadata,
+                                        prior_fingerprints, content_hash_override)
+
+    def _process_element_chunk(self, df_chunk: pd.DataFrame, doc_id: str, doc_title: str, metadata: dict,
+                               prior_fingerprints: dict = None, content_hash_override: str = None):
+        """
+        Parses a single dataframe chunk in 'element' mode, extracting text, titles, and metadata from specified columns.
+        """
+        texts = []
+        titles = []
+        metadatas = []
+
+        title_column: str = self.crawler_config.get("title_column", None)
+        text_columns: list[str] = list(self.crawler_config.get("text_columns", []))
+        metadata_columns: list[str] = list(
+            self.crawler_config.get("metadata_columns", [])
+        )
+        # New config option: if True, use title_column only for doc_title, not for section titles
+        use_title_for_doc_only: bool = self.crawler_config.get("use_title_for_doc_only", False)
+
+        for _, row in df_chunk.iterrows():
+            if title_column and not use_title_for_doc_only:
+                titles.append(str(row[title_column]))
+            text = " - ".join(
+                str(row[col]) for col in text_columns if pd.notnull(row[col])
+            )
+            texts.append(unicodedata.normalize("NFD", text))
+            md = {
+                column: row[column]
+                for column in metadata_columns
+                if pd.notnull(row[column])
+            }
+            metadatas.append(md)
+        if len(titles) == 0:
+            titles = None
+        doc_metadata = metadata.copy()
+
+        for column in metadata_columns:
+            if len(df_chunk[column].unique()) == 1 and not pd.isnull(df_chunk[column].iloc[0]):
+                value = df_chunk[column].iloc[0]
+                # Convert numpy types to native Python types for JSON serialization
+                if hasattr(value, 'item'):
+                    value = value.item()
+                doc_metadata[column] = value
+
+        # Use title from title_column for doc_title if specified
+        if title_column and title_column in df_chunk.columns:
+            final_title = str(df_chunk[title_column].iloc[0])
+        else:
+            final_title = titles[0] if titles else doc_title
+        logger.debug(f"Indexing {len(df_chunk)} rows for doc_id '{doc_id}'")
+
+        self.indexer.index_segments(
+            doc_id=doc_id,
+            doc_metadata=doc_metadata,
+            doc_title=final_title,
+            metadatas=metadatas,
+            texts=texts,
+            titles=titles,
+            prior_fingerprint=(prior_fingerprints or {}).get(doc_id),
+            content_hash_override=content_hash_override,
+        )
+
+
+def process_dataframe_file(
+    file_path: str,
+    metadata: dict,
+    doc_id: str,
+    df_parser,
+    df_config: dict,
+    source_name: str = None,
+    prior_fingerprints: dict = None,
+    content_hash_override: str = None,
+) -> bool:
+    """
+    Common utility to process CSV or Excel files using the DataframeParser.
+    Used by multiple crawlers (SharePoint, Confluence, etc.) to avoid code duplication.
+
+    Args:
+        file_path: Path to the CSV/Excel file
+        metadata: Existing metadata dictionary
+        doc_id: Document ID for indexing
+        df_parser: DataframeParser instance (should be initialized)
+        df_config: Dataframe processing configuration dict
+        source_name: Optional source name to add to metadata (e.g., 'sharepoint', 'confluence_attachment')
+        prior_fingerprints: Incremental-reindex map {corpus_doc_id: fingerprint}. Each emitted
+            document (per sheet / per element chunk) is skipped when its fingerprint matches.
+        content_hash_override: Stable content signal (e.g. Drive modifiedTime) used instead of
+            the LLM table-summary text, which is not stable across runs. Both default to
+            None/empty, so crawlers that don't run incremental keep their current behavior.
+
+    Returns:
+        bool: Success status
+
+    Raises:
+        InvalidFileError: If file is not supported or cannot be read
+    """
+    if not df_parser:
+        logger.error("DataframeParser not initialized. Cannot process dataframe file.")
+        return False
+
+    df_parser.last_error = None
+    try:
+        if not supported_by_dataframe_parser(file_path):
+            df_parser.last_error = f"unsupported extension for dataframe parser: {file_path}"
+            logger.error(f"'{file_path}' is not supported by DataframeParser.")
+            return False
+
+        logger.info(f"Processing dataframe file: {file_path}")
+
+        file_type = determine_dataframe_type(file_path)
+        doc_title = os.path.basename(file_path)
+
+        # Add source-specific metadata
+        df_metadata = metadata.copy()
+        if source_name:
+            df_metadata['source'] = source_name
+        df_metadata['file_type'] = file_type
+
+        if file_type == 'csv':
+            separator = get_separator_by_file_name(file_path)
+            encoding = df_config.get('csv_encoding', 'utf-8')
+            try:
+                df = pd.read_csv(file_path, sep=separator, encoding=encoding)
+            except Exception as e:
+                logger.warning(f"Failed to read CSV with encoding {encoding}: {e}. Trying with 'latin-1'")
+                df = pd.read_csv(file_path, sep=separator, encoding='latin-1')
+
+            df_parser.process_dataframe(
+                df=df,
+                doc_id=doc_id,
+                doc_title=doc_title,
+                metadata=df_metadata,
+                prior_fingerprints=prior_fingerprints,
+                content_hash_override=content_hash_override,
+            )
+
+        elif file_type in ['xls', 'xlsx']:
+            xls = open_excel_with_fallback(file_path)
+            sheet_names = df_config.get("sheet_names")
+
+            # If sheet_names is not specified or is None, process all sheets
+            if sheet_names is None:
+                sheet_names = xls.sheet_names
+
+            for sheet_name in sheet_names:
+                if sheet_name not in xls.sheet_names:
+                    logger.warning(f"Sheet '{sheet_name}' not found in '{file_path}'. Skipping.")
+                    continue
+
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+                sheet_doc_id = f"{doc_id}_{sheet_name}"
+                sheet_doc_title = f"{doc_title} - {sheet_name}"
+                sheet_metadata = df_metadata.copy()
+                sheet_metadata['sheet_name'] = sheet_name
+
+                df_parser.process_dataframe(
+                    df=df,
+                    doc_id=sheet_doc_id,
+                    doc_title=sheet_doc_title,
+                    metadata=sheet_metadata,
+                    prior_fingerprints=prior_fingerprints,
+                    content_hash_override=content_hash_override,
+                )
+
+        return True
+
+    except Exception as e:
+        df_parser.last_error = f"process_dataframe_file exception: {e}"
+        logger.error(f"Error processing dataframe file {file_path}: {e}")
+        return False

@@ -1,8 +1,9 @@
 import logging
+logger = logging.getLogger(__name__)
 from core.crawler import Crawler
 from omegaconf import OmegaConf
 import json
-from core.utils import create_session_with_retries, html_to_text
+from core.utils import create_session_with_retries, html_to_text, configure_session_for_ssl
 from typing import List, Dict, Any
 from datetime import datetime
 
@@ -14,17 +15,18 @@ def datetime_to_date(datetime_str: str) -> str:
 
 class DiscourseCrawler(Crawler):
 
-    def __init__(self, cfg: OmegaConf, endpoint: str, customer_id: str, corpus_id: int, api_key: str) -> None:
-        super().__init__(cfg, endpoint, customer_id, corpus_id, api_key)
+    def __init__(self, cfg: OmegaConf, endpoint: str, corpus_key: str, api_key: str) -> None:
+        super().__init__(cfg, endpoint, corpus_key, api_key)
         self.discourse_base_url = self.cfg.discourse_crawler.base_url
         self.discourse_api_key = self.cfg.discourse_crawler.discourse_api_key
         self.session = create_session_with_retries()
+        configure_session_for_ssl(self.session, self.cfg.discourse_crawler)
 
     # function to fetch the topics from the Discourse API
     def get_topics(self) -> List[Dict[str, Any]]:
         url = self.discourse_base_url + '/latest.json'
         topics = []
-        params = { 'api_key': self.discourse_api_key, 'api_username': 'ofer@vectara.com', 'page': '0'}
+        params = { 'api_key': self.discourse_api_key, 'api_username': 'user@vectara.com', 'page': '0'}
         page = 0
         while True:
             response = self.session.get(url, params=params)
@@ -51,38 +53,38 @@ class DiscourseCrawler(Crawler):
         # parse the response JSON
         posts = list(json.loads(response.text)['post_stream']['posts'])
         document = {
-            'documentId': 'topic-' + str(topic_id),
+            'id': 'topic-' + str(topic_id),
             'title': topic['title'],
-            'metadataJson': json.dumps({
+            'metadata': {
                 'created_at': datetime_to_date(topic['created_at']),
-                'last_posted_at': datetime_to_date(topic['last_posted_at']),
+                'last_updated': datetime_to_date(topic['last_posted_at']),
                 'source': 'discourse',
                 'url': self.discourse_base_url + '/t/' + str(topic_id)
-            }),
-            'section': []
+            },
+            'sections': []
         }
         for post in posts:
             section = {
                 'text': html_to_text(post['cooked']),
-                'metadataJson': json.dumps({
+                'metadata': {
                     'created_at': datetime_to_date(post['created_at']),
-                    'updated_at': datetime_to_date(post['updated_at']),
+                    'last_updated': datetime_to_date(post['updated_at']),
                     'poster': post['username'],
                     'poster_name': post['name'],
                     'source': 'discourse',
                     'url': self.discourse_base_url + '/p/' + str(post['id'])
-                }),
+                },
             }
             if 'title' in post:
                 section['title'] = post['title']
-            document['section'].append(section)
+            document['sections'].append(section)
 
         self.indexer.index_document(document)
         return posts
 
     def crawl(self) -> None:
         topics = self.get_topics()
-        logging.info(f"Indexing {len(topics)} topics from Discourse")
+        logger.info(f"Indexing {len(topics)} topics from Discourse")
         for topic in topics:
             posts = self.index_posts(topic)
-            logging.info(f"Indexed {len(posts)} posts for topic {topic['id']} from Discourse")
+            logger.info(f"Indexed {len(posts)} posts for topic {topic['id']} from Discourse")

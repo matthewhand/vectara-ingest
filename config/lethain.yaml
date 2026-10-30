@@ -1,7 +1,7 @@
 vectara:
-  corpus_id: 240
-  customer_id: 1526022105
+  corpus_key: lethain
   reindex: true
+  create_corpus: true
 
 crawling:
   crawler_type: website
@@ -11,4 +11,3 @@ website_crawler:
     ["https://infraeng.dev/", "https://staffeng.com/", "https://lethain.com/"]
   num_per_second: 1
   pages_source: sitemap # options are: (1) 'sitemap' automatically retreived from website (2) 'crawl' for recursive crawling
-  extraction: playwright # pdf or playwright

@@ -1,7 +1,7 @@
 vectara:
-  corpus_id: 166
-  customer_id: 1526022105
+  corpus_key: legalaid-il
   reindex: false
+  create_corpus: true
 
 crawling:
   crawler_type: website
@@ -11,4 +11,3 @@ website_crawler:
   pos_regex: [".*illinoislegalaid.*"]
   num_per_second: 1
   pages_source: sitemap # options are: (1) 'sitemap' automatically retreived from website (2) 'crawl' for recursive crawling
-  extraction: playwright # pdf or playwright

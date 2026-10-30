@@ -1,61 +1,144 @@
+# Stage 1: Build stage
+FROM python:3.12-slim AS builder
 
-FROM ubuntu:22.04
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
+ENV http_proxy=$HTTP_PROXY
+ENV https_proxy=$HTTPS_PROXY
+ENV no_proxy=$NO_PROXY
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    HOME=/home/vectara  \
+    HOME=/home/vectara \
+    XDG_RUNTIME_DIR=/tmp \
+    RAY_DEDUP_LOGS="0" \
+    CUDA_VISIBLE_DEVICES="" \
+    UV_SYSTEM_PYTHON=1
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libopenblas-dev \
+    ffmpeg \
+    wget \
+    git \
+    curl \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/* /tmp/*
+
+# Install Python packages
+WORKDIR ${HOME}
+COPY requirements.txt requirements-extra.txt $HOME/
+
+RUN pip install --no-cache-dir uv==0.6.14
+# Take the torch pins from requirements.txt rather than repeating them here:
+# hardcoded copies go stale on a lock bump, and the newer torch then comes from
+# PyPI as the CUDA build. The final check fails the build if that happens --
+# CUDA wheels are ~2 GB and nothing loads them (CUDA_VISIBLE_DEVICES="").
+RUN TORCH_PINS="$(grep -E '^(torch|torchvision)==' requirements.txt)" \
+    && test -n "$TORCH_PINS" \
+    && uv pip install --no-cache-dir $TORCH_PINS --index-url https://download.pytorch.org/whl/cpu \
+    && uv pip install --no-cache-dir -r requirements.txt \
+    && if pip list --format=freeze | grep '^nvidia-'; then \
+           echo "ERROR: CUDA wheels installed above -- CPU torch was overridden" >&2; \
+           exit 1; \
+       fi
+
+# unstructured (>=0.24) tokenizes with spaCy's en_core_web_sm and, when the model
+# is missing, downloads it from GitHub on first use -- which fails in offline and
+# egress-restricted deployments. Bake it in for every variant; the version must
+# match the URL unstructured hardcodes in unstructured/nlp/tokenize.py.
+RUN uv pip install --no-cache-dir "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85" \
+    && python3 -c "import spacy; spacy.load('en_core_web_sm')"
+
+ARG INSTALL_EXTRA=false
+RUN if [ "$INSTALL_EXTRA" = "true" ]; then \
+        uv pip install --no-cache-dir -r requirements-extra.txt && \
+        python3 -m spacy download en_core_web_lg; \
+    fi
+    
+# ray vendors a private aiohttp for its runtime-env agent under
+# ray/_private/runtime_env/agent/thirdparty_files; scanners flag that copy
+# separately from the site-packages one. Same grep-from-lock pattern as the
+# torch pins above so it can never go stale on a lock bump.
+RUN AGENT_DIR=/usr/local/lib/python3.12/site-packages/ray/_private/runtime_env/agent/thirdparty_files \
+    && AIOHTTP_PIN="$(grep -E '^aiohttp==' requirements.txt)" \
+    && test -n "$AIOHTTP_PIN" \
+    && pip install --no-cache-dir --no-deps --upgrade --target "$AGENT_DIR" "$AIOHTTP_PIN" \
+    && find "$AGENT_DIR" -maxdepth 1 -name 'aiohttp-*.dist-info' \
+         ! -name "aiohttp-${AIOHTTP_PIN#aiohttp==}.dist-info" -exec rm -rf '{}' +
+
+# Clean up unnecessary files
+RUN find /usr/local -type d \( -name test -o -name tests \) -exec rm -rf '{}' + \
+    && find /usr/local -type f \( -name '*.pyc' -o -name '*.pyo' \) -exec rm -rf '{}' + \
+    && find /usr/local -type d -name '__pycache__' -exec rm -rf '{}' + \
+    && rm -rf /root/.cache/* /tmp/*
+
+# Clean up unnecessary files in site-packages
+RUN find /usr/local/lib/python3.12/site-packages \
+    -type d \( -name 'tests' -o -name 'test' -o -name 'examples' \) -exec rm -rf '{}' + \
+    && find /usr/local/lib/python3.12/site-packages -type d -name '__pycache__' -exec rm -rf '{}' + \
+    && find /usr/local/lib/python3.12/site-packages -type f -name '*.pyc' -exec rm -f '{}' + \
+    && find /usr/local/lib/python3.12/site-packages -type f -name '*.pyo' -exec rm -f '{}' +
+
+# Stage 2: Final image
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HOME=/home/vectara \
     XDG_RUNTIME_DIR=/tmp \
     RAY_DEDUP_LOGS="0" \
     CUDA_VISIBLE_DEVICES=""
 
-RUN sed 's/main$/main universe/' -i /etc/apt/sources.list
-RUN apt-get upgrade
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    wget \
-    git \
-    curl \
-    vim \
-    wkhtmltopdf \
-    libssl-dev \
-    unixodbc \
-    poppler-utils \
+# Install runtime dependencies
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     tesseract-ocr \
-    libtesseract-dev \
-    xvfb \
-    python3-pip python3-dev \
-    libmagic1  \
-    libfontconfig fontconfig \
-    libjpeg-turbo8 \
-    fonts-noto-color-emoji unifont fonts-indic xfonts-75dpi \
-    && apt-get purge -y \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    ffmpeg \
+    unixodbc poppler-utils libmagic1 libjpeg62-turbo \
+    libfontconfig fonts-noto-color-emoji unifont fonts-indic xfonts-75dpi \
+    libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+    libgtk-3-0 libatspi2.0-0 libgbm1 libasound2 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install python packages
+# Copy Python packages and application code from the builder stage
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Install Playwright browsers
+RUN playwright install chromium \
+    && rm -f /usr/local/bin/pwdebug \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache/*
+
+# Set working directory
 WORKDIR ${HOME}
-COPY requirements.txt requirements-extra.txt $HOME/
-RUN pip install --no-cache-dir torch==2.1.2 --index-url https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir -r requirements.txt \
-    && find /usr/local -type d \( -name test -o -name tests \) -exec rm -rf '{}' + \
-    && find /usr/local -type f \( -name '*.pyc' -o -name '*.pyo' \) -exec rm -rf '{}' + \
-    && find /usr/local -type d \( -name '__pycache__' \) -exec rm -rf '{}' + \
-    && find /usr/local -type d \( -name 'build' \) -exec rm -rf '{}' + \
-    && rm -rf .cache/* /tmp/* \
-    && pip cache purge
-RUN playwright install --with-deps firefox
 
-# Install additional large packages for all-docs unstructured inference and PII detection
-ARG INSTALL_EXTRA=false
-RUN if [ "$INSTALL_EXTRA" = "true" ]; then \
-        pip3 install --no-cache-dir -r requirements-extra.txt && \
-        python3 -m spacy download en_core_web_lg; \
+COPY docker/bin/download-docling-models.py /bin/
+
+ARG DOWNLOAD_DOCLING_MODELS=false
+
+# Pre-bake everything an air-gapped docling parse needs: layout/table/formula/EasyOCR
+# models (HuggingFace + JAIDED) and the NLTK data docling fetches from GitHub at runtime
+# (punkt_tab, averaged_perceptron_tagger_eng — not gated by HF_HUB_OFFLINE). $HOME/nltk_data
+# is on NLTK's default search path, so no env var is needed to find it.
+RUN if [ "$DOWNLOAD_DOCLING_MODELS" = "true" ]; then \
+            HF_HUB_DISABLE_XET=1 python3 /bin/download-docling-models.py 1>&2 && \
+            python3 -m nltk.downloader -d $HOME/nltk_data punkt_tab averaged_perceptron_tagger_eng 1>&2 && \
+            rm -rf $HOME/.cache/huggingface; \
     fi
 
+# Once models are pre-baked above, force docling/huggingface_hub to use them
+# instead of attempting a network fetch (required for air-gapped deployments).
+ENV HF_HUB_OFFLINE=${DOWNLOAD_DOCLING_MODELS}
+ENV TRANSFORMERS_OFFLINE=${DOWNLOAD_DOCLING_MODELS}
+
+# Copy application code
 COPY *.py $HOME/
 COPY core/*.py $HOME/core/
 COPY crawlers/ $HOME/crawlers/
 
-#SHELL ["/bin/bash", "-c"]
-ENTRYPOINT ["/bin/bash", "-l", "-c"]
-CMD ["python3 ingest.py $CONFIG $PROFILE"]
+COPY docker/bin/docker-entrypoint.sh /bin/docker-entrypoint.sh
+RUN chmod +x /bin/docker-entrypoint.sh
+
+# Use the script as the entrypoint
+ENTRYPOINT ["/bin/docker-entrypoint.sh"]

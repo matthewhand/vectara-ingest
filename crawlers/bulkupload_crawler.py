@@ -1,27 +1,36 @@
 import logging
+logger = logging.getLogger(__name__)
 from core.crawler import Crawler
 import json
+from core.utils import get_docker_or_local_path
 
 def is_valid(json_object):
-    return 'documentId' in json_object and 'section' in json_object
+    return 'id' in json_object and 'sections' in json_object
 
-class JACrawler(Crawler):
+class BulkuploadCrawler(Crawler):
 
     def crawl(self) -> None:
-        json_file = '/home/vectara/data/file.json'
+        docker_path = '/home/vectara/data/file.json'
+        config_path = self.cfg.bulkupload_crawler.json_path
+
+        json_file = get_docker_or_local_path(
+            docker_path=docker_path,
+            config_path=config_path
+        )
+
         with open(json_file, 'r') as file:
             data = file.read()
         json_array = json.loads(data)
-        if type(json_array) != list:
+        if not isinstance(json_array, list):
             raise Exception("JSON file must contain an array of JSON objects")
 
-        logging.info(f"indexing {len(json_array)} JSON documents from JSON file")
+        logger.info(f"indexing {len(json_array)} JSON documents from JSON file")
         count = 0
         for json_object in json_array:
             if count % 100 == 0:
-                logging.info(f"finished {count} documents so far")
+                logger.info(f"finished {count} documents so far")
             if is_valid(json_object):
                 self.indexer.index_document(json_object)
                 count += 1
             else:
-                logging.info(f"invalid JSON object: {json_object}")
+                logger.warning(f"invalid JSON object: {json_object}")

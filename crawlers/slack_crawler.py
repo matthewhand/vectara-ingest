@@ -2,8 +2,8 @@ import time
 import re
 import ray
 import psutil
-import json
 import logging
+logger = logging.getLogger(__name__)
 import datetime
 from omegaconf import OmegaConf
 from slack_sdk import WebClient
@@ -34,15 +34,16 @@ def get_timestamp(days_past):
     return epoch_time
 
 
-def construct_url_of_message(message, channel_id):
+def construct_url_of_message(message, channel_id, workspace_url="https://vectara.slack.com"):
     """
     Creates a link for of Slack message based on the channel id and message timestamp
     :param message: a Slack message
     :param channel_id: ID of the channel where message was sent
+    :param workspace_url: Base URL of the Slack workspace
     :return:
     """
     timestamp = message["ts"]
-    message_link = f"https://vectara.slack.com/archives/{channel_id}/p{timestamp}"
+    message_link = f"{workspace_url}/archives/{channel_id}/p{timestamp}"
     return message_link
 
 
@@ -57,7 +58,7 @@ def get_datetime_from_epoch(epoch_time):
     return datetime.datetime.fromtimestamp(float(epoch_time)).strftime('%Y-%m-%d %H:%M')
 
 
-def get_doc_metadata(channel, message, users_info):
+def get_doc_metadata(channel, message, users_info, workspace_url="https://vectara.slack.com"):
     """
     Creates a metadata for the document that would be indexed in the vectara.
 
@@ -73,6 +74,7 @@ def get_doc_metadata(channel, message, users_info):
     :param channel: contains a list of channels
     :param message: Slack message
     :param users_info: list of slack users for a workspace
+    :param workspace_url: Base URL of the Slack workspace
     :return:
     """
     metadata = {}
@@ -82,16 +84,16 @@ def get_doc_metadata(channel, message, users_info):
             "channel": channel["name"],
             "author": users_info.get(message.get("user"), "bot"),
             "message_time": get_datetime_from_epoch(message["ts"]),
-            "url": construct_url_of_message(message, channel["id"])
+            "url": construct_url_of_message(message, channel["id"], workspace_url)
         })
         if message.get("latest_reply"):
             metadata["latest_reply_time"] = get_datetime_from_epoch(message["latest_reply"])
         if message.get("reply_users_count"):
             metadata["no_of_users_involved"] = message["reply_users_count"]
     except KeyError as e:
-        logging.error(f"Error while creating the metadata: {e}")
+        logger.error(f"Error while creating the metadata: {e}")
 
-    return json.dumps(metadata)
+    return metadata
 
 
 def replace_user_id_with_user_handler(messages, users_info):
@@ -115,17 +117,17 @@ def replace_user_id_with_user_handler(messages, users_info):
                         text = text.replace(f"<@{uid}>", f"@{username}")
                         message["text"] = text
     except KeyError as e:
-        logging.error(f"Error replacing user id's with user handlers: {e}")
+        logger.error(f"Error replacing user id's with user handlers: {e}")
 
 
-def get_document(channel, message, users_info):
+def get_document(channel, message, users_info, workspace_url="https://vectara.slack.com"):
     """
-    Returns the document to indexed in vectara
+    Returns the document to be indexed in Vectara
 
     Example output : {
-        "documentId": "vectara_123_1234556",
-        "metadataJson": {"author": "Vectara"},
-        "section": [{"text": "Slack messages info"},
+        "id": "vectara_123_1234556",
+        "metadata": {"author": "Vectara"},
+        "sections": [{"text": "Slack messages info"},
         {"text": "Messages has replies", "metadata": "{"author": "Vectara"}"}]
     }
 
@@ -136,6 +138,7 @@ def get_document(channel, message, users_info):
     :param channel:
     :param message:
     :param users_info:
+    :param workspace_url: Base URL of the Slack workspace
     :return:
     """
 
@@ -143,7 +146,7 @@ def get_document(channel, message, users_info):
     doc_id = f'vectara_{channel["id"]}_{message["ts"]}'
     message_date = datetime.datetime.fromtimestamp(float(message["ts"])).strftime('%Y-%m-%d')
     title = f'{users_info.get(message.get("user"), "bot")}@{channel["name"]} - {message_date}'
-    doc_metadata = get_doc_metadata(channel, message, users_info)
+    doc_metadata = get_doc_metadata(channel, message, users_info, workspace_url)
     sections = []
 
     if doc_text == '':
@@ -164,35 +167,35 @@ def get_document(channel, message, users_info):
                 try:
                     sections.append({
                         "text": reply.get("text"),
-                        "metadataJson": json.dumps({
+                        "metadata": {
                             "replier": users_info[reply["user"]],
                             "reply_time": get_datetime_from_epoch(reply["ts"])
-                        })
+                        }
                     })
                 except KeyError:
                     continue
 
     return {
-        "documentId": doc_id,
+        "id": doc_id,
         "title": title,
-        "metadataJson": doc_metadata,
-        "section": sections
+        "metadata": doc_metadata,
+        "sections": sections
     }
 
 
 def handle_slack_api_error(api_name, error):
     if error.response.status_code == 429:
         retry_after = int(error.response.headers['Retry-After']) + 1
-        logging.warning(f"Slack rate limit error occurred for {api_name}. Will retry after {retry_after} seconds")
+        logger.warning(f"Slack rate limit error occurred for {api_name}. Will retry after {retry_after} seconds")
         time.sleep(retry_after)  # wait for retry_after seconds before sending another request
     else:
-        logging.error(f"Error while fetching the messages: {error}")
+        logger.error(f"Error while fetching the messages: {error}")
 
 
 
 def handle_incomplete_request_error(api_name, error, retry_delay=30):
-    logging.error(f"IncompleteRead error occurred: {error}")
-    logging.info(f"Will retry to fetch the {api_name} after 30 seconds")
+    logger.error(f"IncompleteRead error occurred: {error}")
+    logger.info(f"Will retry to fetch the {api_name} after 30 seconds")
     time.sleep(retry_delay)  # wait for 30 seconds before sending another request
 
 
@@ -232,61 +235,63 @@ def contains_url(message):
 
 
 class SlackCrawler(Crawler):
-    def __init__(self, cfg: OmegaConf, endpoint: str, customer_id: str, corpus_id: int, api_key: str):
-        super().__init__(cfg, endpoint, customer_id, corpus_id, api_key)
+    def __init__(self, cfg: OmegaConf, endpoint: str, corpus_key: str, api_key: str):
+        super().__init__(cfg, endpoint, corpus_key, api_key)
         self.user_token = self.cfg.slack_crawler.slack_user_token
         self.client = WebClient(token=self.user_token)
         self.days_past = self.cfg.slack_crawler.get("days_past", None)
         self.channels_to_skip = self.cfg.slack_crawler.get("channels_to_skip", [])
         self.retries = self.cfg.slack_crawler.get("retries", 5)
+        self.workspace_url = self.cfg.slack_crawler.get("workspace_url", "https://vectara.slack.com")
+
+    def _with_retries(self, what, fn):
+        """
+        Call fn() up to self.retries times, returning its result on the first
+        success. Returns None when all attempts fail.
+        """
+        for _ in range(self.retries):
+            try:
+                return fn()
+            except IncompleteRead as e:
+                handle_incomplete_request_error(what, e)
+            except SlackApiError as e:
+                handle_slack_api_error(what, e)
+            except KeyError as e:
+                logger.error(f"Error while fetching the {what}: {e}")
+        logger.error(f"Giving up fetching {what} after {self.retries} attempts")
+        return None
 
     def get_users_info(self):
         """
         Returns the list of the users of the workspace.
         API docs: https://api.slack.com/methods/users.list
         """
-        for _ in range(self.retries):
-            try:
-                users_info = {}
-                users_response = self.client.users_list()
-                users = users_response["members"]
-                for user in users:
-                    users_info[user["id"]] = user["profile"]["display_name_normalized"]
+        def fetch():
+            users_info = {}
+            users_response = self.client.users_list()
+            for user in users_response["members"]:
+                users_info[user["id"]] = user["profile"]["display_name_normalized"]
+            logger.info("Users information retrieved")
+            return users_info
 
-                logging.info("Users information retrieved")
-                return users_info
-
-            except IncompleteRead as e:
-                handle_incomplete_request_error("users", e)
-
-            except SlackApiError as e:
-                handle_slack_api_error("users", e)
-
-            except KeyError as e:
-                logging.error(f"Error while fetching the users info: {e}")
+        users_info = self._with_retries("users info", fetch)
+        return users_info if users_info is not None else {}
 
     def get_channels(self):
         """
         Returns the list of the channels of the workspace.
         API docs: https://api.slack.com/methods/conversations.list
         """
+        def fetch():
+            channels = []
+            for result in self.client.conversations_list():
+                for channel in result["channels"]:
+                    channels.append(channel)
+            logger.info("channels retrieved")
+            return channels
 
-        channels = []
-        for _ in range(self.retries):
-            try:
-                for result in self.client.conversations_list():
-
-                    for channel in result["channels"]:
-                        channels.append(channel)
-
-                logging.info("channels retrieved")
-                return channels
-
-            except IncompleteRead as e:
-                handle_incomplete_request_error("channels", e)
-
-            except SlackApiError as e:
-                handle_slack_api_error("channels", e)
+        channels = self._with_retries("channels", fetch)
+        return channels if channels is not None else []
 
     def get_messages_of_channel(self, channel, users_info):
         """
@@ -299,34 +304,30 @@ class SlackCrawler(Crawler):
         messages = []
         cursor = None
         last_message_timestamp = None
-        response = None
         if self.days_past is not None:
             last_message_timestamp = str(get_timestamp(self.days_past))
 
         while True:
-            for _ in range(self.retries):
-                try:
+            # limit represent number of messages to return in a request. Default value is 100 and
+            # max is 999. Slack recommends no more than 200 results at a time.
+            # Check API docs for more detail.
+            response = self._with_retries(
+                f"messages of channel `{channel['name']}`",
+                lambda: self.client.conversations_history(channel=channel["id"], oldest=last_message_timestamp,
+                                                          cursor=cursor,
+                                                          limit=200))
+            if response is None:
+                logger.error(f"Aborting message fetch for channel `{channel['name']}`; "
+                             f"returning {len(messages)} messages fetched so far")
+                break
 
-                    # limit represent number of messages to return in a request. Default value is 100 and
-                    # max is 999. Slack recommends no more than 200 results at a time.
-                    # Check API docs for more detail.
-                    response = self.client.conversations_history(channel=channel["id"], oldest=last_message_timestamp,
-                                                                 cursor=cursor,
-                                                                 limit=200)
-                except IncompleteRead as e:
-                    handle_incomplete_request_error("messages", e)
+            messages += response["messages"]
+            # Check if there are more messages to retrieve
+            if not response["has_more"]:
+                logger.info(f"messages fetched successfully for channel `{channel['name']}`")
+                break
+            cursor = response["response_metadata"]["next_cursor"]
 
-                except SlackApiError as e:
-                    handle_slack_api_error("messages", e)
-
-            if response is not None:
-                messages += response["messages"]
-                # Check if there are more messages to retrieve
-                if not response["has_more"]:
-                    break
-                cursor = response["response_metadata"]["next_cursor"]
-
-        logging.info(f"messages fetched successfully for channel `{channel['name']}`")
         replace_user_id_with_user_handler(messages, users_info)
         return messages
 
@@ -346,18 +347,14 @@ class SlackCrawler(Crawler):
         :param users_info: list of Slack users
         :return:
         """
-        for _ in range(self.retries):
-            try:
-                replies_response = self.client.conversations_replies(channel=channel_id, ts=message_ts)
-                replies = replies_response["messages"][1:]  # skipping the 1st message since it's a parent message
-                replace_user_id_with_user_handler(replies, users_info)
-                return replies
+        def fetch():
+            replies_response = self.client.conversations_replies(channel=channel_id, ts=message_ts)
+            replies = replies_response["messages"][1:]  # skipping the 1st message since it's a parent message
+            replace_user_id_with_user_handler(replies, users_info)
+            return replies
 
-            except IncompleteRead as e:
-                handle_incomplete_request_error("threaded messages", e)
-
-            except SlackApiError as e:
-                handle_slack_api_error("threaded messages", e)
+        replies = self._with_retries("threaded messages", fetch)
+        return replies if replies is not None else []
 
     def crawl(self) -> None:
         """
@@ -379,27 +376,32 @@ class SlackCrawler(Crawler):
         ray_workers = self.cfg.slack_crawler.get("ray_workers", 0)  # -1: use ray with ALL cores, 0: dont use ray
         if ray_workers == -1:
             ray_workers = psutil.cpu_count(logical=True)
+
         if ray_workers > 0:
             self.indexer.p = self.indexer.browser = None
             ray.init(num_cpus=ray_workers, log_to_driver=True, include_dashboard=False)
-            logging.info(f"Using {ray_workers} ray workers")
+            logger.info(f"Using {ray_workers} ray workers")
             users_info_id = ray.put(users_info)
+            actors = [ray.remote(SlackMsgIndexer).remote(self.indexer, self) for _ in range(ray_workers)]
+            for a in actors:
+                a.setup.remote()
+            pool = ray.util.ActorPool(actors)
 
         for channel in channels_to_crawl:
             messages = self.get_messages_of_channel(channel, users_info)
-            logging.info(f"Will process {len(messages)} messages of the channel: {channel['name']}")
+            logger.info(f"Will process {len(messages)} messages of the channel: {channel['name']}")
             if ray_workers > 0:
-                actors = [ray.remote(SlackMsgIndexer).remote(self.indexer, self) for _ in range(ray_workers)]
-                for a in actors:
-                    a.setup.remote()
-                pool = ray.util.ActorPool(actors)
                 _ = list(pool.map(lambda a, msg: a.process.remote(channel, msg, users_info_id), messages))
             else:
                 msg_indexer = SlackMsgIndexer(self.indexer, self)
                 for inx, msg in enumerate(messages):
                     if inx % 100 == 0:
-                        logging.info(f"Indexed {inx + 1} messages out of {len(messages)}")
+                        logger.info(f"Indexed {inx + 1} messages out of {len(messages)}")
                     msg_indexer.process(channel, msg, users_info)
+        
+        # Cleanup Ray workers if used
+        if ray_workers > 0:
+            ray.shutdown()
 
 
 class SlackMsgIndexer(object):
@@ -418,11 +420,10 @@ class SlackMsgIndexer(object):
         if contains_url(msg.get("text")):
             remove_duplicate_urls(msg)
         msg = self.slack_crawler.add_message_replies(msg, channel['id'], users_info)
-        document = get_document(channel, msg, users_info)
+        document = get_document(channel, msg, users_info, self.slack_crawler.workspace_url)
         if document is not None:
             self.indexer.index_document(document)
         else:
-            link = construct_url_of_message(msg, channel['id'])
-            logging.info(f"Unable to find text for the message: {link}")
-            
+            link = construct_url_of_message(msg, channel['id'], self.slack_crawler.workspace_url)
+            logger.info(f"Unable to find text for the message: {link}")
 

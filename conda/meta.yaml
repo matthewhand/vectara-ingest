@@ -1,0 +1,72 @@
+{% set name = "vectara-ingest" %}
+{%- set version = environ.get('GIT_DESCRIBE_TAG', '0.1.0').lstrip('v') %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ..  # Use parent directory as the source
+
+build:
+  number: 0
+  skip_compile_pyc:
+    - "*.py"
+  binary_relocation: False
+  # Build steps live in build.sh (unix) and bld.bat (Windows). They can't share
+  # one `script:` block: it runs under cmd.exe on Windows, where `unset` does
+  # not exist.
+  entry_points:
+    - vectara-ingest = ingest:app
+
+requirements:
+  host:
+    - python >=3.11,<3.12
+    - pip
+    - setuptools
+
+  run:
+    - python >=3.11,<3.12
+    - pip
+    # Linux dependencies with conda-forge channel specified
+    - conda-forge::cairo  # [linux]
+    - conda-forge::xorg-libxrender  # [linux]
+    - conda-forge::libstdcxx-ng  # [linux]
+    - conda-forge::libgcc-ng  # [linux]
+    - conda-forge::libgl  # [linux]
+    
+    # System dependencies with conda-forge channel specified
+    # No chromium here: Playwright downloads and launches its own browser
+    # (see core/web_content_extractor.py), and conda-forge has no chromium package.
+    - conda-forge::poppler
+    - conda-forge::tesseract
+    - conda-forge::libjpeg-turbo
+    - conda-forge::libmagic
+    - conda-forge::fontconfig
+    - conda-forge::ffmpeg
+
+test:
+  imports:
+    - core
+    - crawlers
+  commands:
+    - echo "Testing if vectara-ingest command is available"
+    - which vectara-ingest
+
+about:
+  home: https://github.com/vectara/vectara-ingest
+  license: Apache-2.0
+  license_family: Apache
+  license_file: LICENSE
+  summary: 'A tool for ingesting content into Vectara from various sources'
+  description: |
+    Vectara-ingest is an open source Python project that demonstrates how to crawl datasets
+    and ingest them into Vectara. It provides a step-by-step guide on building your own crawler
+    and some pre-built crawlers for ingesting data from sources such as websites, RSS feeds,
+    Jira tickets, Notion notes, Docusaurus documentation sites, Slack, and many others.
+  doc_url: https://github.com/vectara/vectara-ingest
+  dev_url: https://github.com/vectara/vectara-ingest
+
+extra:
+  recipe-maintainers:
+    - vectara 

@@ -22,6 +22,7 @@ Vectara is the trusted GenAI platform providing simple [APIs](https://docs.vecta
 * RSS feeds
 * Jira tickets
 * Notion notes
+* Wolken KB articles
 * Docusaurus documentation sites
 * Slack
 * And many others...
@@ -29,6 +30,15 @@ Vectara is the trusted GenAI platform providing simple [APIs](https://docs.vecta
 For more information about this repository, see [Code Organization](#code-organization) and [Crawling](#crawling).
 
 # Getting Started Guide
+
+vectara-ingest can be used in multiple ways:
+
+1. **Docker container** - The instructions below show how to run vectara-ingest in a Docker container
+2. **Command-line interface (CLI)** - vectara-ingest can be installed as a CLI tool using conda
+3. **Python package** - vectara-ingest can be imported and used in your Python applications
+
+For details on using vectara-ingest as a conda package or importing it in your code, please refer to the [conda/README.md](conda/README.md) file.
+
 This guide explains how to create a basic crawler to scrape content from [Paul Graham's website](http://www.paulgraham.com/index.html), and ingest it into Vectara.
 
 ## Prerequisites
@@ -82,24 +92,29 @@ For our example we would index the content of https://www.paulgraham.com website
 3. In the `secrets.toml` file, change `api_key` to the Vectara API Key.
 
    To retrieve your API key from the Vectara console, click **Access Control** in your corpus view or use the **Authorization** Tab.
+   You can use your Vectara personal API key, or a query+write API key.
 
 4. In the `config/` directory, copy the `news-bbc.yaml` config file to `pg-rss.yaml`.
 
 5. Edit the `pg-rss.yaml` file and make the following changes:
 
-   1. Change the `vectara.corpus_id` value to the ID of the corpus into which you want to ingest the content of the website.
+   1. Change the `vectara.corpus_key` value to the corpus_key for the corpus into which you want to ingest the content of the website.
 
-      To retrieve your corpus ID from the Vectara console, click **Data > Your Corpus Name** and you will see the ID on the top of the screen.
-      
-   2. Change the `vectara.customer_id` value to the ID of your account.
+      To retrieve your corpus key from the Vectara console, click your corpus name dropdown and you will see the key on the top of the screen.
 
-      To retrieve your customer ID from the Vectara console, click your username in the upper-right corner.
+   2. Change `rss_crawler.source` to `pg`.
+      
+   3. Change `rss_crawler.rss_pages` to `["http://www.aaronsw.com/2002/feeds/pgessays.rss"]` so it points to the Paul Graham RSS feed.
+      
+   4. Change `rss_crawler.days_past` to `365`.
 
-   3. Change `rss_crawler.source` to `pg`.
-      
-   4. Change `rss_crawler.rss_pages` to `["http://www.aaronsw.com/2002/feeds/pgessays.rss"]` so it points to the Paul Graham RSS feed.
-      
-   5. Change `rss_crawler.days_past` to `365`.
+6. If Vectara is installed in your datacenter, and you are using an internal certificate authority:
+   1. Write the entire certificate chain to `ca.pem` in the main `vectara-ingest` folder.
+   2. Update your crawler config to include the following.
+      ```yaml
+      vectara:
+         ssl_verify: /home/vectara/env/ca.pem
+      ```
 
 ## Step 3: Run the crawler
 
@@ -115,14 +130,14 @@ For our example we would index the content of https://www.paulgraham.com website
    * On Linux, ensure that the `run.sh` file is executable by running the following command:
   
      ```bash
-     cmhod +x run.sh
+     chmod +x run.sh
      ```
 
    * On Windows, ensure that you run this command from within the WSL 2 environment.
 
    **Note:** To protect your system's resources and make it easier to move your crawlers to the cloud, the crawler executes inside a Docker container. This is a lengthy process because in involves numerous dependencies
 
-1. When the container is set up, you can track your crawler’s progress:
+1. When the container is set up, you can track your crawler's progress:
 
    ```bash
    docker logs -f vingest
@@ -169,19 +184,42 @@ Each configuration YAML file includes a set of standard variables, for example:
 
 ```yaml
 vectara:
-  # the corpus ID for indexing
-  corpus_id: 4
+  # endpoint for Vectara platform
+  endpoint: api.vectara.io
+
+  # authentication URL for OAuth (when using create_corpus)
+  auth_url: auth.vectara.io
+
+  # Define SSL verification for Vectara Platform
+  # If `False`, SSL verification is disabled (not recommended for production). 
+  # If a string, it is treated as the path to a custom CA certificate file. 
+  # If `True` or not provided, default SSL verification is used.
+  ssl_verify: True
+
+  # the corpus key for indexing
+  corpus_key: my-corpus
   
-  # the Vectara customer ID
-  customer_id: 1234567
-  
+  # Chunking strategy
+  chunking_strategy: sentence   # sentence or fixed
+  chunk_size: 512               # only applies for "fixed" strategy
+
   # flag: should vectara-ingest reindex if document already exists (optional)
   reindex: false
+
+  # flag: should vectara-ingest create the corpus (optional). defaults to false. 
+  # When using this option, make sure your secrets.toml includes the personal API key.
+  create_corpus: false
   
   # flag: store a copy of all crawled data that is indexed into a local folder
+  # If enabled, data will be stored in this folder "~/tmp/mount/indexed_docs_XXX" in your local machine,
+  # where XXX is a unique ID.
   store_docs: false
   
-  # timeout: sets the URL crawling timeout in seconds (optional)
+  # Directory path where vectara-ingest will store all output files, including reports, temporary files, and other artifacts. When running locally, this path is relative to the current working directory. When running in Docker, files are inside the container at `/home/vectara/{output_dir}/`. Default value is `vectara_ingest_output`.
+  output_dir: vectara_ingest_output
+
+  # timeout: sets the URL crawling timeout in seconds (optional; defaults to 90)
+  # this applies to crawling web pages.
   timeout: 90
 
   # post_load_timeout: sets additional timeout past full page load to wait for animations and AJAX
@@ -197,25 +235,167 @@ vectara:
   # this can be helpful when processing news pages or others which have a lot of advertising content
   remove_boilerplate: false
 
-  # flag: enable special processing for tables inside PDFs or HTML (optional)
-  # Notes:
-  # 1. This processing uses OPENAI, and requires to list the OPENAI_API_KEY in your `secrets.toml` under a special profile called `general`.
-  # 2. If enabled, 
-  #    - When crawling PDF files, the code will extract table content, then use GPT-4o to summarize the table, and ingest this summarized text while into Vectara.
-  #    - Simiarly, when crawling HTML files, any HTML table data will be summarized with GPT-4o
-  # 3. This processing is quite slow and will require you to have an additional paid subscription to OpenAI. The code uses the "detectron2_onnx" unstructured model which is fastest. You can modify this to use one of the alternatives: https://unstructured-io.github.io/unstructured/best_practices/models.html) if you want a slower but more performance model.
-  # See [here](TABLE_SUMMARY.md) for some examples of how table summary works.
-  summarize_tables: false
-  
   # Whether masking of PII is attempted on all text fields (title, text, metadata values)
   # Notes: 
   # 1. This masking is never done on files uploaded to Vectara directly (via e.g. indexer.index_file())
   # 2. Masking is done using Microsoft Presidio PII analyzer and anonymizer, and is limited to English only
   mask_pii: false
 
+  # Which whisper model to use for audio files (relevant for YT, S3 and folder crawlers)
+  # Valid values: tiny, base, small, medium or large. Defaults to base.
+  whisper_model: the model name for whisper
+
+  # user agent to use when crawling web pages; defaults to standard agent.
+  # If your website prevents crawling, you can allow a specific user agent and specify it here.
+  user_agent: "vectara-crawler"
+
+doc_processing:
+
+  # which model to use for text processing (table summary, contextual chunking or data extraction), and for image processing.
+  # - provider can be "openai" or "anthropic" or "private". default is "openai"
+  # - base_url is an optional URL pointing to a privately-hosted URL for model serving
+  #   1) If you host the private endpoint locally (on your laptop), note that you would need to provide access
+  #      to it from within the Docker image. For example: "http://host.docker.internal:5000/v1"
+  #   2) If your private API requires an api_key (recommended) then include PRIVATE_API_KEY in your secrets.toml
+  #      file under the `general` profile (same place you would include your `OPENAI_API_KEY`)
+  #   3) If you use different API keys for text and vision models, you can specify PRIVATE_TEXT_API_KEY and
+  #      PRIVATE_VISION_API_KEY separately in secrets.toml. These override PRIVATE_API_KEY when specified.
+  # - model_name is the model name to use for each type of processing (table, vision or contextual)
+  #
+  # For backwards compatibility, if you specify the "model" argument, then the same
+  # model is assumed for both text and vision processing, and model_name is also respected, 
+  # ignoring anything else in model_config.
+  #
+  model: openai         # can be openai, or anthropic.
+  model_name: 'gpt-4o'
+
+  model_config:
+    text:
+      provider: openai
+      base_url: https://api.openai.com/v1
+      model_name: "gpt-4o"
+    vision:
+      provider: private
+      base_url: https://vllm.mycompany.com/
+      model_name: "llama3.3-70B"
+
+  # which document parser to use for local file parsing: unstructured, llama_parse, docupanda or docling
+  # If using llama_parse, you need to add LLAMA_CLOUD_API_KEY in your `secrets.toml` file.
+  # If using docupanda, you need to add DOCUPANDA_API_KEY in your `secrets.toml` file
+  doc_parser: docling
+
+  # Whether or not to parse tables from documents and ingest into Vectara.
+  # When enabled this feature applies to PDF, HTML, PPT, DOCX files and requires setting 
+  # the OPENAI_API_KEY or ANTHROPIC_API_KEY in your `secrets.toml` under a special profile called `general`.
+  # Tables extracted will be ingested into Vectara along with a summary generated by the LLM
+  # This processing might be slow and will require you to have an additional paid subscription to OpenAI or ANTHROPIC. 
+  # Table parsing will be performed by the doc_parser, unless `enable_gmft` is enabled (only for PDF files).
+  # See [here](docs/TABLE_SUMMARY.md) for some examples of how table summary works.
+  parse_tables: false
+
+  # use GMFT to parse tables from PDF
+  enable_gmft: true
+
+  # use OCR when parsing documents (Docling only)
+  do_ocr: true
+
+  # OCR engine to use: 'easyocr' (default) or 'rapidocr'
+  # RapidOCR is lighter weight and comes pre-installed with Docling
+  # EasyOCR provides broader language support but requires more memory
+  ocr_engine: easyocr
+
+  # Optional parameters for EasyOCR (when ocr_engine: easyocr)
+  easy_ocr_config:
+     download_enabled: true
+     use_gpu: false
+     lang: ['en', 'fr', 'de']
+     confidence_threshold: 0.5
+     force_full_page_ocr: false
+
+  # Optional parameters for RapidOCR (when ocr_engine: rapidocr)
+  rapid_ocr_config:
+     lang: ['en', 'de']
+     force_full_page_ocr: false
+     text_score: 0.5
+
+  # Whether or not to summarize image content using GPT-4o vision 
+  # When using this feature, you need to list the OPENAI_API_KEY or ANTHRPIC_API_KEY in your `secrets.toml` 
+  # under a special profile called `general`.
+  # This processing might be slow and will require you to have an additional paid subscription to OpenAI or ANTHROPIC. 
+  summarize_images: false
+
+  # Whether to include image binary data alongside image summaries during indexing
+  # When enabled, images are indexed with their full binary data using Vectara's new image support
+  # Requires `summarize_images: true` and works in these cases:
+  # - File upload API processing (Case A)
+  # - Local file processing when inline_images is false (Case B) 
+  # - URL processing when inline_images is false (Case C)
+  add_image_bytes: false
+
+  # Whether to index images inline within the document flow or as separate documents
+  # When true (default), images are indexed as part of the main document in their natural position
+  # When false, images are indexed as separate documents (legacy behavior)
+  inline_images: true
+
+  # Unstructured document parsing configuration
+  unstructured_config:
+    chunking_strategy: basic           # chunking strategy to use: basic, by_title or none; default by_title
+    chunk_size: 1024                   # chunk size if using unstructured chunking; default 1024
+    hi_res_model_name: yolox           # layout model for PDFs: yolox (default), yolox_quantized, detectron2_onnx
+
+  # Docling document parsing configuartion
+  docling_config:
+    chunking_strategy: hybrid          # chunking strategy to use: hierarchical, hybrid or none; default none
+    image_scale: 1.0                   # set to 2.0 for larger resolution in diagrams. 1.0 is equivalent to 72 DPI
+    chunk_size: 1024                   # chunk size if using docling chunking; default 1024; only valid for hybrid chunker
+    layout_model: null                 # layout model: null (default heron), heron, heron_101, v2
+    do_formula_enrichment: false       # enable formula enrichment for PDFs; default false (off enables MPS acceleration on Mac)
+
+  # Docling can classify a region, or a whole page, as a picture and nest the text it finds
+  # there under the picture: CAD drawings and schematics often come out as one picture per
+  # sheet. That text is indexed as text on the picture's page, and with summarize_images on it
+  # is also given to the vision model, so the summary reads labels and values from it.
+
+  # Docling's layout and table-structure models are fetched from HuggingFace Hub on first
+  # use by default, which fails in air-gapped/on-prem environments with no HF access. See
+  # "Building for on-prem / air-gapped deployments" under Docker for pre-baked images. If you
+  # build with DOWNLOAD_DOCLING_MODELS=true but then pick a layout_model or do_formula_enrichment
+  # setting that wasn't baked in, ingestion will fail outright rather than fall back to a fetch.
+
+  # whether to use core_indexing which maintains the chunks from unstructured or docling, or let vectara chunk further
+  # NOTE: Automatically enabled when chunking_strategy is not 'none' in document parsers like Unstructured or Docling
+  use_core_indexing: false
+
+  # Split large PDFs into smaller parts for processing.
+  # Splitting is disabled by default. To enable, set max_pdf_size to the maximum file size (in MB)
+  # above which a PDF will be split. pages_per_pdf controls how many pages per split chunk.
+  # max_pdf_size: 50                  # max PDF size in MB before splitting (default: no splitting)
+  # pages_per_pdf: 100               # number of pages per split chunk (default: 100)
+
+  # enable contextual chunking (only for PDF files at the moment)
+  contextual_chunking: false            
+
+  # defines a set of optional metadata attributes, each with a "query" to extract that value
+  # requires OPENAI_API_KEY or ANTHROPIC_API_KEY to be defined.
+  extract_metadata:
+    'num_pages': 'number of pages in this document'
+    'date': 'date of this document'
+
+
 crawling:
   # type of crawler; valid options are website, docusaurus, notion, jira, rss, mediawiki, discourse, github and others (this continues to evolve as new crawler types are added)
   crawler_type: XXX
+
+
+# This section can be added to your job configuration to allow tagging of metadata statically.
+# Each document created in the corpus will have the document metadata merged with the metadata here.
+# If a crawler adds metadata that conflicts with this metadata, the crawler metadata will be used.
+metadata:
+   project: foo
+   groups:
+     - group1
+     - group2
+     - group3
 ```
 
 Following that, where needed, the same YAML configuration file will a include crawler-specific section with crawler-specific parameters (see [about crawlers](crawlers/CRAWLERS.md)):
@@ -225,6 +405,86 @@ XXX_crawler:
   # specific parameters for the crawler XXX
 ```
 
+### Document Processing and Chunking
+
+#### Local vs Server-Side Processing (`process_locally`)
+
+The `process_locally` setting determines whether documents are parsed locally or using Vectara's file upload API. **Important: This is an all-or-nothing decision** - if ANY feature requires local processing, the ENTIRE document is processed locally.
+
+**Automatic Local Processing Override**
+Local processing is automatically enabled when:
+- The file is PDF, HTML, DOCX, or PPTX
+- AND any of these features are enabled:
+  - `contextual_chunking`
+  - `summarize_images` 
+  - `enable_gmft` (table extraction)
+
+**Processing Paths:**
+- **Path A - File Upload API** (when `process_locally = False` and no local features needed):
+  - Vectara handles parsing server-side
+  - Faster and simpler
+  - Limited feature support
+  
+- **Path B - Local Processing** (when `process_locally = True` or local features detected):
+  - Full document parsed locally
+  - All content extracted locally (text, tables, images)
+  - Parsed segments sent to Vectara
+  - Required for advanced features
+
+**Example:** If you enable `summarize_images=true`, the system automatically processes EVERYTHING locally (text, tables, and images), not just images.
+
+#### Image Binary Data Support
+
+The `add_image_bytes` feature enables indexing of images with their full binary data alongside text summaries. This uses Vectara's native image support to store both the image description and the actual image file.
+
+**Requirements:**
+- `summarize_images: true` must be enabled
+- Works only when images are processed as separate documents
+
+**Supported Processing Cases:**
+- **Case A**: File Upload API processing - captures binary data from document parsers
+- **Case B**: Local file processing when `inline_images: false` - uses extracted image binary data  
+- **Case C**: URL processing when `inline_images: false` - downloads and stores web image binary data
+
+**Technical Details:**
+- Images are indexed using Vectara's document structure with `images` array
+- Binary data includes automatic MIME type detection (PNG, JPEG, GIF, ICO)
+- Image IDs link summaries to their corresponding binary data
+- Maintains backward compatibility when disabled
+
+#### Automatic Core Indexing
+When using chunking strategies with either Unstructured or Docling parsers, `use_core_indexing` is **automatically enabled**. This ensures that the chunks created by the parser are preserved in Vectara without additional chunking.
+
+#### Position-Based Document Ordering
+All document parsers now use a position-based ordering system that maintains the exact document structure:
+- Elements are assigned positions using the formula: `page_num * 1000 + element_index`
+- Images receive an additional +0.5 offset to appear right after their preceding text
+- This ensures proper interleaving of text, images, and tables in their natural document order
+
+#### Dual Extraction for Chunked Documents
+When chunking is enabled (`chunking_strategy` != 'none'), the UnstructuredDocumentParser performs two extraction passes:
+1. **First pass**: Extracts raw elements without chunking to capture complete tables and images
+2. **Second pass**: Extracts chunked text for optimal text processing
+3. **Final merge**: Combines both extractions using position-based ordering
+
+This approach ensures:
+- Tables remain intact and are not broken across chunks
+- Images are properly extracted with their full context
+- Text benefits from intelligent chunking
+- Document structure is preserved
+
+#### Parser-Specific Chunking Strategies
+
+**Unstructured Parser:**
+- `none`: No chunking, preserves original document structure
+- `basic`: Simple chunking based on size limits (default with `use_core_indexing`)
+- `by_title`: Chunks based on document headings and structure
+
+**Docling Parser:**
+- `none`: No chunking (default)
+- `hybrid`: Combines structural and size-based chunking
+- `hierarchical`: Chunks based on document hierarchy
+
 ### Secrets management
 
 We use a `secrets.toml` file to hold secret keys and parameters. You need to create this file in the root directory before running a crawl job. This file can hold multiple "profiles", and specific specific secrets for each of these profiles. For example:
@@ -232,6 +492,12 @@ We use a `secrets.toml` file to hold secret keys and parameters. You need to cre
 ```
 [general]
 OPENAI_API_KEY="sk-..."
+ANTHROPIC_API_KEY="sk-..."
+PRIVATE_API_KEY="YOUR-PRIVATE-API_KEY"
+# Optional: separate API keys for private text and vision models
+# These override PRIVATE_API_KEY when specified
+PRIVATE_TEXT_API_KEY="YOUR-PRIVATE-TEXT-API-KEY"
+PRIVATE_VISION_API_KEY="YOUR-PRIVATE-VISION-API-KEY"
 
 [profile1]
 api_key="<VECTAR-API-KEY-1>"
@@ -248,7 +514,30 @@ The use of the `toml` standard allows easy secrets management when you have mult
 
 Many of the crawlers have their own secrets, for example Notion, Discourse, Jira, or GitHub. These are also kept in the `secrets.toml` file in the appropriate section and need to be all upper case (e.g. `NOTION_API_KEY` or `JIRA_PASSWORD`).
 
-If you are using the table summarization feature, which utilizes OPENAI, you have to provide your own OPENAI API key. In this case, you would need to put that key under the `[general]` profile. This is a special profile name reserved for this purpose.
+For the Wolken KB crawler, add these secrets prefixed with `WOLKEN_` under your profile section:
+```
+[profile1]
+api_key="<VECTARA-API-KEY>"
+WOLKEN_API_ENDPOINT="https://api-mycompany.wolkenservicedesk.com"
+WOLKEN_DOMAIN="mycompany"
+WOLKEN_CLIENT_ID="your-client-id"
+WOLKEN_SERVICE_ACCOUNT="service@mycompany.com"
+WOLKEN_AUTH_CODE="Basic ..."
+WOLKEN_REFRESH_TOKEN="your-refresh-token"
+```
+
+If you are using the table summarization, image summarization or contextual retreival features, 
+you have to provide your own LLM key (either OPENAI_API_KEY or ANTHROPIC_API_KEY). 
+In this case, you would need to put that key under the `[general]` profile. This is a special profile name reserved for this purpose.
+
+### Adding Custom CA Certificates
+
+This container supports adding custom CA certificates at runtime. When using `./run.sh` if a ssl directory exists, 
+it will be mounted to the container as `./ssl:/ssl:ro`. Within the container
+if a `/ssl` directory exists and contains `.crt` files, the container will:
+
+1. Copy them into the system certificate store at `/usr/local/share/ca-certificates/`
+2. Run `update-ca-certificates` to install them
 
 ### Indexer Class
 
@@ -271,13 +560,107 @@ Use these when you build the `document` JSON structure directly and want to inde
 
 #### Parameters
 
-The `reindex` parameter determines whether an existing document should be reindexed or not. If reindexing is required, the code automatically takes care of that by calling `delete_doc()` to first remove the document from the corpus and then indexes the document.
+The `reindex` parameter determines whether an existing document should be reindexed or not. If reindexing is required, the code automatically takes care of that by calling `delete_doc()` to first remove the document from the corpus and then indexes the document. This flag governs crawls that do not run in incremental mode; under `incremental: true` changed documents are replaced automatically and `reindex` is not needed (see [Incremental reindexing](#incremental-reindexing)).
+
+## Incremental reindexing
+
+By default a crawl re-fetches, re-parses and re-uploads every document on every run. For large or slow sources that is wasteful when most content has not changed. Several crawlers (website, docs, rss, s3, folder, gdrive, notion) support an `incremental` mode that keeps the corpus in sync with the source while skipping unchanged work.
+
+How it works (no external state — the corpus itself is the manifest):
+
+1. At index time each document is stamped with a `fingerprint` in its metadata. The fingerprint covers the document's content signal **plus** the metadata written to Vectara (e.g. GDrive `acl_groups`) **plus** the processing config (`doc_parser`, chunking, `extract_metadata`, the `model_config` provider/model names, OCR and `whisper_model` settings, etc.). Any of those changing re-indexes the document. The content signal is chosen to be stable across runs: the normalized extracted **text** for fetched web pages (the rendered HTML isn't byte-stable), the raw **bytes** for downloaded files, and Drive's **`modifiedTime`** for Google-native Docs/Sheets/Slides (whose exports aren't byte-stable).
+2. On the next run a single corpus listing reconstructs what is already indexed and its fingerprint.
+3. Each item is compared: unchanged → skipped; changed → re-indexed; present in the corpus but gone from the source → deleted (only when `remove_old_content: true`).
+4. Where the source exposes a cheap "last changed" signal — sitemap `<lastmod>`, RSS `pub_date`, S3 `LastModified`, file mtime — items that are not newer than what was last indexed are skipped **before** they are even fetched. Each document also stores the config signature it was processed with; the pre-fetch skip is disabled when that differs from the current config, so a processing-config change re-indexes even timestamp-stable items. The pre-fetch skip cannot see metadata-only changes that don't move the source timestamp (e.g. an edited folder/s3 `metadata_file` row) — those are only caught by the fingerprint when the item is fetched.
+
+Config knobs (per crawler block):
+
+* `incremental: true` — enable the skip/fingerprint logic. Default `false`; with it off the crawler behaves exactly as before and writes no new metadata.
+* `remove_old_content: true` — delete documents that no longer exist at the source.
+* `deletion_safety_ratio` (default `0.5`) — refuse to delete if the crawl saw fewer than this fraction of the documents already in the corpus, or if it was interrupted. This guards against a partial/failed crawl wiping live data. Set to `0` to disable the guard.
+
+To keep a corpus consistent with a changing source, run with `incremental: true` and `remove_old_content: true`. Under incremental mode only changed documents are re-sent, and they are replaced automatically — you do not need `reindex: true` (if set it is harmless and logged as redundant). See [crawlers/CRAWLERS.md](crawlers/CRAWLERS.md#incremental-reindexing-website-docs-rss-s3-folder-gdrive-notion) for a mode-selection guide, the upgrade path, and the deprecation roadmap for `reindex`.
+
+Notes and limitations:
+
+* The content fingerprint for web pages is computed over the page's normalized extracted text (not the rendered HTML, which isn't byte-stable across fetches). An image whose pixels change behind a stable URL (and which the website crawler indexes as a separate summarized document) is not detected by the text hash alone; rely on the source's last-changed signal or an occasional full reindex for those.
+* GDrive permission/sharing changes do not bump Drive `modifiedTime`, so the gdrive crawler does not use a timestamp pre-skip — it always evaluates the (metadata-inclusive) fingerprint so ACL changes are reflected in the corpus.
+* For `model_config`, only the `provider` and `model_name` of each model enter the fingerprint — swapping the summarization/vision model re-indexes affected documents on the next run, while deployment-only fields (`base_url`, credentials, project) can change freely without triggering a re-index. Likewise only the active OCR engine's config (`easy_ocr_config` or `rapid_ocr_config`, per `ocr_engine`) participates.
+* The metadata fields `fingerprint`, `content_hash`, `config_sig`, `source`, `parent_doc_id`, and `sitemap_lastmod` are written by the ingest pipeline when `incremental` is on; do not set them yourself. `source` keeps its usual per-crawler value (e.g. `docs_system` for the docs crawler) and scopes the skip/deletion pass, so several crawlers can share one corpus; don't change it between runs of the same crawler.
+* For file crawlers (folder, s3), `remove_old_content` requires `incremental: true` (a single file can map to several corpus documents that are only made safe to diff under incremental). Media, spreadsheet, and split-PDF documents are protected from deletion but are re-indexed every run rather than skipped. For RSS, `remove_old_content` deletes anything outside the current feed window, so leave it off unless you want the corpus to mirror the feed.
 
 ## Deployment
 
 ### Docker
 
 The project is designed to be used within a Docker container, so that a crawl job can be run anywhere - on a local machine or on any cloud machine. See the [Dockerfile](https://github.com/vectara/vectara-ingest/blob/main/Dockerfile) for more information on the Docker file structure and build.
+
+#### HTTP Proxy
+
+If the `http_proxy`, `https_proxy`, or `no_proxy` environment variables exist, they will be used during the docker build step.
+
+#### Additional environment variables
+
+Additional environment variables can be injected into the docker container using the `.run-env` file. Below is an example
+of the format. 
+
+```bash
+HF_ENDPOINT="http://localhost:9000"
+```
+
+#### Building for on-prem / air-gapped deployments
+
+By default, `docling` (the PDF/DOCX/PPTX/HTML parser) fetches its layout-detection and
+table-structure (TableFormer) models from HuggingFace Hub the first time it's used, the
+default OCR engine (EasyOCR) fetches its models from GitHub releases, and docling fetches
+NLTK data from GitHub. All fail in environments with no outbound network access to those hosts.
+
+A single build-arg pre-bakes all of these into the image at build time instead:
+
+```bash
+docker build \
+  --build-arg DOWNLOAD_DOCLING_MODELS=true \
+  -t vectara-ingest:latest.onprem .
+```
+
+Or build and run in one step through `run.sh` by setting the same flag as an environment
+variable (default off). `run.sh` forwards it to the build, tags the resulting image
+`latest.onprem` so it never overwrites your regular `:latest` image, and sets `HF_ENDPOINT`
+to an unreachable host at runtime so any regression that still tries to reach the Hub fails
+loudly instead of silently:
+
+```bash
+DOWNLOAD_DOCLING_MODELS=true bash run.sh <config-file> <secrets-profile>
+```
+
+`DOWNLOAD_DOCLING_MODELS=true` bakes:
+
+- docling's default layout model (heron), both alternate layout models selectable via
+  `docling_config.layout_model` (heron_101, v2), TableFormer, and the CodeFormula model used
+  by `do_formula_enrichment` — everything `docling_config` can select — and sets
+  `HF_HUB_OFFLINE=true`/`TRANSFORMERS_OFFLINE=true` so no HF network call is attempted at runtime.
+- EasyOCR's `craft` detector plus recognizers for the scripts covering the world's most-used
+  languages. Recognizers are per-script, not per-language, and the runtime script is chosen by
+  `easy_ocr_config.lang` (default `fr`/`de`/`es`/`en` → Latin):
+  - gen2 (~15-20MB each): Latin (`en`/`fr`/`de`/`es`/`it`/`pt`/`nl`/… ), Simplified Chinese,
+    Japanese, Korean, Cyrillic (`ru`/`uk`/`bg`/… ).
+  - gen1 (~190MB each): Devanagari (`hi`), Arabic (`ar`/`ur`), Bengali (`bn`).
+
+  Selecting a script outside this set fails air-gapped (runtime downloads are force-disabled). To
+  add one, extend the recognizer lists in `docker/bin/download-docling-models.py`.
+- The NLTK data docling uses (`punkt_tab`, `averaged_perceptron_tagger_eng`). Without it, offline
+  runs log download errors and fall back to a degraded tokenizer path.
+
+On a `regular` (`INSTALL_EXTRA=false`) build the base image is 4.04GB; the docling models add
+~1.6GB, the EasyOCR bundle adds ~750MB (mostly the three ~190MB gen1 scripts), and NLTK data adds
+~15MB, for an on-prem image of ~6.4GB. (The previous all-language EasyOCR bundle made this ~8.5GB.)
+
+Pre-built `latest.onprem` and `<version>.onprem` tags are published to `ghcr.io` and Docker Hub
+alongside the regular (`latest`) and `.full` tags.
+
+Not covered: `ocr_engine: rapidocr` fetches its models from ModelScope over plain HTTPS,
+independent of `HF_HUB_OFFLINE`, and has no pre-bake support today. Air-gapped deployments
+should use `ocr_engine: easyocr` (the default) with one of the baked scripts listed above.
 
 ### Local deployment
 
@@ -291,6 +674,23 @@ To run `vectara-ingest` locally, perform the following steps:
   
   This command creates the Docker container locally, configures it with the parameters specified in your configuration file (with secrets taken from the appropriate `<profile>` in `secrets.toml`), and starts up the Docker container.
 
+### Crash Recovery and Resume
+
+All crawlers automatically write progress to a SQLite tracking database (`crawl_tracking.db`) stored in the output directory. Every indexed, failed, or skipped document is recorded as it is processed.
+
+If a crawl is interrupted for any reason — crash, `SIGTERM`, `docker stop`, OOM, or any other failure — progress is already persisted. On the next run:
+
+* With `reindex: false` (the default), the crawler reads progress from the DB, skips already-processed documents, and continues from where it left off.
+* With `reindex: true`, the DB is reset and the crawl starts fresh.
+
+#### Graceful shutdown
+
+Send `SIGTERM` (or `docker stop`) and the crawler will exit cleanly after finishing the current document or batch. Send a second `SIGTERM` to force-quit immediately.
+
+The `crawl_tracking.db` file lives inside the mounted output volume (`~/tmp/mount/` on the host by default), so it persists automatically between container restarts.
+
+**Crawlers with crash recovery support:** Jira, GitHub, Confluence, Notion, Website, Folder, S3.
+
 ### Cloud deployment on Render
 
 If you want your `vectara-ingest` to run on [Render](https://render.com/), please follow these steps:
@@ -302,7 +702,8 @@ Specify Docker Image: In the "Image URL" fill in "vectara/vectara-ingest" and cl
 1. Choose a name for your deployment (e.g. "vectara-ingest"), and if you need to pick a region or leave the default. Then pick your instance type.
 2. Click "Create Web Service"
 3. Click "Environment", then "Add Secret File": name the file config.yaml, and copy the contents of the config.yaml for your crawler
-4. Assuming you have a `secrets.toml` file with multiple profiles and you want to use the secrets for the profile `[my-profile]`, click "Environment", then "Add Secret File": name the file secrets.toml, and copy only the contents of `[my-profile]` from the secrets.toml to this file (incuding the profile name). Make sure to copy `[general]` profile and your OPENAI_API_KEY if you are using table summarization.
+4. Assuming you have a `secrets.toml` file with multiple profiles and you want to use the secrets for the profile `[my-profile]`, click "Environment", then "Add Secret File": name the file secrets.toml, and copy only the contents of `[my-profile]` from the secrets.toml to this file (incuding the profile name). 
+Make sure to copy `[general]` profile and your OPENAI_API_KEY or ANTHROPIC_API_KEY if you are using table summarization, image summarization of contextual retreival.
 5. Click "Settings" and go to "Docker Command" and click "Edit", the enter the following command:
 `/bin/bash -c mkdir /home/vectara/env && cp /etc/secrets/config.yaml /home/vectara/env/ && cp /etc/secrets/secrets.toml /home/vectara/env/ && python3 ingest.py /home/vectara/env/config.yaml <my-profile>"`
 

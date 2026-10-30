@@ -1,7 +1,7 @@
 vectara:
-  corpus_id: 151
-  customer_id: 1526022105
+  corpus_key: news-cnn
   reindex: false
+  create_corpus: false
 
 crawling:
   crawler_type: rss
@@ -38,4 +38,3 @@ rss_crawler:
     ]
   days_past: 30
   delay: 1
-  extraction: playwright # pdf or playwright

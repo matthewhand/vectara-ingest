@@ -1,0 +1,270 @@
+import hashlib
+import logging
+import os
+import re
+import tempfile
+import json
+from typing import Dict, Any, Optional
+from email.utils import parsedate_to_datetime
+from datetime import datetime
+from urllib.parse import unquote, urlparse, urlunparse
+from bs4 import BeautifulSoup
+from omegaconf import OmegaConf
+
+logger = logging.getLogger(__name__)
+
+
+def md5_hex(text: str) -> str:
+    """md5 hex digest of a string (utf-8). Single source for the content-hash idiom used by
+    incremental reindexing (page HTML, structured-doc text, config signature, fingerprints).
+    Not a security hash (usedforsecurity=False keeps FIPS builds and scanners happy)."""
+    return hashlib.md5(text.encode("utf-8"), usedforsecurity=False).hexdigest()
+
+
+def get_chunking_config(cfg: OmegaConf) -> Optional[Dict]:
+    """Helper function to get chunking configuration"""
+    if cfg.vectara.get("chunking_strategy", "sentence") == "fixed":
+        chunk_size = cfg.vectara.get("chunk_size", 512)
+        return {
+            "type": "max_chars_chunking_strategy",
+            "max_chars_per_chunk": chunk_size
+        }
+    return None
+
+
+def extract_last_modified(url: str, html: str) -> dict:
+    """
+    Extract last modified date from HTML content.
+    Strategies: meta tags, time elements, regex search, fallback to hash
+    """
+    # Always carry a content hash so callers can fingerprint the page regardless of which
+    # last-modified detection method (if any) succeeds. Used by incremental reindexing.
+    result = {
+        'url': url,
+        'detection_method': None,
+        'content_hash': md5_hex(html),
+    }
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # 1) META tags
+    for attr in ('http-equiv', 'name'):
+        tag = soup.find('meta', attrs={attr: lambda v: v and v.lower() == 'last-modified'})
+        if tag and tag.get('content'):
+            try:
+                dt = parsedate_to_datetime(tag['content'])
+                result.update(last_modified=dt, detection_method='meta')
+                return result
+            except Exception:
+                continue
+
+    # 2) <time datetime="…">
+    times = []
+    for time_tag in soup.find_all('time', datetime=True):
+        dt_str = time_tag['datetime'].strip()
+        for parser in (parsedate_to_datetime, datetime.fromisoformat):
+            try:
+                dt = parser(dt_str)
+                times.append(dt)
+                break
+            except Exception:
+                continue
+    if times:
+        result.update(last_modified=max(times), detection_method='time')
+        return result
+
+    # 3) Regex search
+    text = soup.get_text(" ", strip=True)
+    patterns = [
+        r'\b\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?\b',
+        r'\b(?:January|February|March|April|May|June|July|'
+        r'August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b',
+    ]
+    candidates = []
+    for pat in patterns:
+        for m in re.finditer(pat, text):
+            dt_str = m.group(0)
+            for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%B %d, %Y"):
+                try:
+                    dt = parsedate_to_datetime(dt_str) if 'T' in dt_str or '-' in dt_str else datetime.strptime(dt_str, fmt)
+                    candidates.append(dt)
+                    break
+                except Exception:
+                    continue
+
+    if candidates:
+        result.update(last_modified=max(candidates), detection_method='regex')
+        return result
+
+    # 4) Fallback: no date found — content_hash (already set above) is the only signal
+    result.update(detection_method='hash')
+    return result
+
+
+def create_upload_files_dict(filename: str, metadata: Dict[str, Any], parse_tables: bool, cfg: OmegaConf) -> Dict[str, Any]:
+    """Create files dictionary for upload API"""
+    upload_filename = os.path.basename(filename)
+    content_type = 'application/pdf' if filename.lower().endswith('.pdf') else 'application/octet-stream'
+    
+    files = {
+        'metadata': (None, json.dumps(metadata), 'application/json'),
+    }
+    
+    if parse_tables and filename.lower().endswith('.pdf'):
+        files['table_extraction_config'] = (None, json.dumps({'extract_tables': True}), 'application/json')
+    
+    chunking_config = get_chunking_config(cfg)
+    if chunking_config:
+        files['chunking_strategy'] = (None, json.dumps(chunking_config), 'application/json')
+    
+    return files, upload_filename, content_type
+
+
+def parse_conflict_doc_id(response_text: str) -> Optional[str]:
+    """Pull the document id out of a Vectara 409 conflict message
+    (`... for document id '<id>' ...`). Returns None if absent.
+
+    Vectara stores upload_file ids verbatim, but the 409 names the EXISTING
+    doc's id, which is not always the one we just sent: when the same content
+    was previously indexed under a different id scheme (e.g. a folder crawl's
+    slugify(name)-<hash> vs a raw file id, or an id scheme that changed between
+    runs), Vectara's content-dedup makes the conflict reference that prior id.
+    A reindex delete must target the id the server reports here rather than the
+    one we uploaded with (deleting the latter 404s)."""
+    m = re.search(r"document id '([^']+)'", response_text)
+    return m.group(1) if m else None
+
+
+def safe_file_cleanup(file_path: str):
+    """Safely remove file if it exists"""
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception as e:
+        logger.warning(f"Failed to remove file {file_path}: {e}")
+
+
+def validate_text_content(text: str, min_length: int = 3) -> bool:
+    """Validate if text content is meaningful"""
+    return text is not None and len(text) >= min_length
+
+
+# Google adds /u/<digits>/ right after the host to indicate the active account
+# context when you're signed into multiple Google accounts. The same document
+# is served either way, so the segment is identity-irrelevant — strip it so
+# /u/0/d/X and /d/X don't churn through the corpus as separate docs.
+_GOOGLE_USER_PREFIX_RE = re.compile(r"^/u/\d+/")
+
+
+def normalize_url_for_metadata(url: str) -> str:
+    """URL-decode and strip Google's /u/N/ account-context segment."""
+    if not (url and isinstance(url, str)):
+        return url
+    decoded = unquote(url)
+    parsed = urlparse(decoded)
+    host = parsed.netloc.lower()
+    if (host == "google.com" or host.endswith(".google.com")) and _GOOGLE_USER_PREFIX_RE.match(parsed.path):
+        new_path = _GOOGLE_USER_PREFIX_RE.sub("/", parsed.path)
+        decoded = urlunparse(parsed._replace(path=new_path))
+    return decoded
+
+
+# Known identity-provider netlocs. Matched by equality OR as a suffix
+# preceded by '.' so subdomains like 'tenant.okta.com' are caught while
+# 'fakeokta.com' is not.
+_AUTH_NETLOCS = (
+    "accounts.google.com",
+    "login.microsoftonline.com",
+    "login.live.com",
+    "login.windows.net",
+    "signin.aws.amazon.com",
+    "auth0.com",
+    "okta.com",
+    "oktapreview.com",
+    "onelogin.com",
+    "pingone.com",
+)
+
+
+def auth_redirect_reason(original_url: str, final_url: str) -> Optional[str]:
+    """Detect that a fetch was bounced into a sign-in / identity-provider page.
+
+    Returns a short human-readable reason string when the netloc changed
+    during the fetch and the new netloc matches a known IDP; otherwise
+    returns None. The check is intentionally conservative: same-domain
+    /login redirects are not flagged, because some sites legitimately
+    serve login content under their own domain.
+    """
+    if not original_url or not final_url:
+        return None
+    try:
+        orig = urlparse(original_url).netloc.lower()
+        final = urlparse(final_url).netloc.lower()
+    except Exception:
+        return None
+    if not orig or not final or orig == final:
+        return None
+    for netloc in _AUTH_NETLOCS:
+        if final == netloc or final.endswith("." + netloc):
+            return f"redirected to identity-provider {final}"
+    return None
+
+
+def is_auth_host(url: str) -> bool:
+    """True if `url`'s host matches a known identity-provider netloc.
+
+    Use this to skip URLs that are sign-in / account-chooser pages reached
+    by a direct link (e.g. an `accounts.google.com/SignOutOptions` link
+    embedded in a partially-authenticated page), where `auth_redirect_reason`
+    does not fire because no netloc change occurred during the fetch.
+    """
+    if not url:
+        return False
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    for netloc in _AUTH_NETLOCS:
+        if host == netloc or host.endswith("." + netloc):
+            return True
+    return False
+
+
+def prepare_file_metadata(metadata: Dict[str, Any], filename: str, static_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Prepare file metadata by adding filename and static metadata"""
+    if static_metadata:
+        metadata.update({k: v for k, v in static_metadata.items() if k not in metadata})
+    
+    metadata['file_name'] = os.path.basename(filename)
+    
+    # URL-decode any URL fields in metadata to prevent double-encoding issues
+    if 'url' in metadata:
+        metadata['url'] = normalize_url_for_metadata(metadata['url'])
+    
+    return metadata
+
+
+def create_temp_pdf_file(pdf_writer) -> str:
+    """Create temporary PDF file and return path"""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", mode='wb', delete=False) as f:
+        pdf_writer.write(f)
+        f.flush()
+        return f.name
+
+
+def store_file(filename: str, orig_filename: str, store_docs: bool, store_docs_folder: str) -> None:
+    """
+    Store a file in the docs folder if configured to do so.
+    
+    Args:
+        filename (str): Source file path
+        orig_filename (str): Original filename to use for storage
+        store_docs (bool): Whether to store documents
+        store_docs_folder (str): Folder to store documents in
+    """
+    import shutil
+    
+    if store_docs:
+        dest_path = f"{store_docs_folder}/{orig_filename}"
+        shutil.copyfile(filename, dest_path)
