@@ -4,6 +4,7 @@ certifi>=2024.8.30
 # >=8.4.2 required by huggingface-hub 1.25+. Needs typer>=0.16 (0.15.x caps
 # click<8.2); typer is held <0.22 by docling-slim.
 click>=8.4.2
+anyio>=4.14.2
 authlib==1.9.1
 feedparser==6.0.11
 pyyaml>=6.0
