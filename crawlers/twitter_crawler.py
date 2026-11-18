@@ -1,96 +1,106 @@
 import logging
-logger = logging.getLogger(__name__)
-from core.crawler import Crawler
-import tweepy
 import re
+from urllib.parse import quote
 
-def get_username_from_id(client, user_id):
-    # Use the get_user method to retrieve the username based on the author_id
-    user = client.get_user(id=user_id)
-    return user.data.username if user else None
+import requests
+
+from core.crawler import Crawler
+
+logger = logging.getLogger(__name__)
+API_URL = "https://api.x.com/2"
+
 
 def clean_tweet(tweet: str) -> str:
-    # Remove mentions that start with @
-    cleaned_tweet = re.sub(r'@\w+', '', tweet)
+    without_mentions = re.sub(r"@\w+", "", tweet)
+    return re.sub(r"\s+", " ", without_mentions).strip()
 
-    # Optional: remove extra spaces that may result from mention removals
-    cleaned_tweet = re.sub(r'\s+', ' ', cleaned_tweet).strip()
 
-    return cleaned_tweet
+def _get_json(session, path, params):
+    response = session.get(f"{API_URL}/{path}", params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
-def fetch_tweets(client, query, num_tweets, fields):
-    # Initialize variables
-    all_tweets = []
-    next_token = None
-    max_results = 50
 
-    # Loop until you collect enough tweets or there are no more tweets to fetch
-    while len(all_tweets) < num_tweets:
-        # Adjust max_results to ensure the total number of tweets does not exceed num_tweets
-        tweets_to_fetch = max(min(max_results, num_tweets - len(all_tweets)), 10)
-        # Search tweets with pagination
-        if next_token:
-            tweets = client.search_recent_tweets(query=query,
-                                                 tweet_fields=fields,
-                                                 max_results=tweets_to_fetch,
-                                                 next_token=next_token)
-        else:
-            tweets = client.search_recent_tweets(query=query,
-                                                 tweet_fields=fields,
-                                                 max_results=tweets_to_fetch)
-        all_tweets.extend(tweets.data)
-        next_token = tweets.meta.get('next_token')
+def fetch_tweets(session, query, num_tweets):
+    params = {
+        "query": query,
+        "tweet.fields": "created_at,public_metrics,author_id,lang",
+        "expansions": "author_id",
+        "user.fields": "username",
+    }
+    remaining = num_tweets
+    while remaining > 0:
+        params["max_results"] = max(10, min(50, remaining))
+        page = _get_json(session, "tweets/search/recent", params.copy())
+        authors = {
+            user["id"]: user["username"]
+            for user in page.get("includes", {}).get("users", [])
+        }
+        tweets = page.get("data", [])[:remaining]
+        for tweet in tweets:
+            yield tweet, authors.get(tweet.get("author_id"))
+        remaining -= len(tweets)
+        next_token = page.get("meta", {}).get("next_token")
         if not next_token:
             break
+        params["next_token"] = next_token
 
-    return all_tweets
 
 class TwitterCrawler(Crawler):
     def crawl(self) -> None:
+        config = self.cfg.twitter_crawler
+        num_tweets = config.num_tweets
+        userhandles = config.userhandles
+        clean_tweets = config.get("clean_tweets", True)
 
-        bearer_token = self.cfg.twitter_crawler.twitter_bearer_token
-        num_tweets = self.cfg.twitter_crawler.num_tweets
-        userhandles = self.cfg.twitter_crawler.userhandles
-        client = tweepy.Client(bearer_token=bearer_token)
+        with requests.Session() as session:
+            session.headers["Authorization"] = f"Bearer {config.twitter_bearer_token}"
+            for username in userhandles:
+                profile = _get_json(
+                    session,
+                    f"users/by/username/{quote(username, safe='')}",
+                    {"user.fields": "created_at,public_metrics,description,location,verified"},
+                ).get("data")
+                if not profile:
+                    logger.warning("Could not look up Twitter profile %s", username)
+                    continue
 
-        for username in userhandles:
-            user = client.get_user(username=username)
-            query = f'@{username} -is:retweet'  # Exclude retweets
-            tweets = fetch_tweets(client, query, num_tweets=num_tweets,
-                                  fields = ['public_metrics', 'author_id', 'lang', 'geo', 'entities'])
-            doc = {
-                "id": 'tweets-' + username,
-                "title": f'top {num_tweets} tweets of {username}',
-                "metadata": {
-                    'url': f'https://twitter.com/{username}',
-                    'source': 'twitter',
-                    'username': username,
-                    'account_created_at': user.data.created_at,
-                    'followers_count': user.data.public_metrics['followers_count'] if user.data.public_metrics else None,
-                    'following_count': user.data.public_metrics['following_count'] if user.data.public_metrics else None,
-                    'tweet_count': user.data.public_metrics['tweet_count'] if user.data.public_metrics else None,
-                    'description': user.data.description,
-                    'location': user.data.location,
-                    'verified': user.data.verified,
-                },
-                "sections": []
-            }
-            for tweet in tweets.data:
-                doc["sections"].append({
-                    "text": clean_tweet(tweet.text) if self.cfg.twitter_crawler.get("clean_tweets", True) else tweet.text,
+                metrics = profile.get("public_metrics") or {}
+                doc = {
+                    "id": "tweets-" + username,
+                    "title": f"top {num_tweets} tweets of {username}",
                     "metadata": {
-                        "author": get_username_from_id(client, tweet.author_id),
-                        "created_at": tweet.created_at,
-                        "retweet_count": tweet.public_metrics['retweet_count'] if tweet.public_metrics else None,
-                        "reply_count": tweet.public_metrics['reply_count'] if tweet.public_metrics else None,
-                        "like_count": tweet.public_metrics['like_count'] if tweet.public_metrics else None,
-                        "quote_count": tweet.public_metrics['quote_count'] if tweet.public_metrics else None,
-                        "lang": tweet.lang
+                        "url": f"https://twitter.com/{username}",
+                        "source": "twitter",
+                        "username": username,
+                        "account_created_at": profile.get("created_at"),
+                        "followers_count": metrics.get("followers_count"),
+                        "following_count": metrics.get("following_count"),
+                        "tweet_count": metrics.get("tweet_count"),
+                        "description": profile.get("description"),
+                        "location": profile.get("location"),
+                        "verified": profile.get("verified"),
                     },
-                })
-            succeeded = self.indexer.index_document(doc)
-            if succeeded:
-                logger.info(f"Indexed tweets for {username}")
-            else:
-                logger.info(f"Error indexing  tweets for {username}")
-        logger.info(f"Finished indexing all users (total={len(userhandles)})")
+                    "sections": [],
+                }
+                query = f"@{username} -is:retweet"
+                for tweet, author in fetch_tweets(session, query, num_tweets):
+                    text = tweet["text"]
+                    metrics = tweet.get("public_metrics") or {}
+                    doc["sections"].append({
+                        "text": clean_tweet(text) if clean_tweets else text,
+                        "metadata": {
+                            "author": author,
+                            "created_at": tweet.get("created_at"),
+                            "retweet_count": metrics.get("retweet_count"),
+                            "reply_count": metrics.get("reply_count"),
+                            "like_count": metrics.get("like_count"),
+                            "quote_count": metrics.get("quote_count"),
+                            "lang": tweet.get("lang"),
+                        },
+                    })
+                if self.indexer.index_document(doc):
+                    logger.info("Indexed tweets for %s", username)
+                else:
+                    logger.warning("Error indexing tweets for %s", username)
+        logger.info("Finished indexing all users (total=%s)", len(userhandles))

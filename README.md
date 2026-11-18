@@ -44,7 +44,7 @@ This guide explains how to create a basic crawler to scrape content from [Paul G
 ## Prerequisites
 * A [Vectara account](https://console.vectara.com/signup)
 * A Vectara corpus with an [API key](https://docs.vectara.com/docs/api-keys) that provides indexing permissions
-* [Python 3.8 (or higher)](https://www.python.org/downloads/)
+* [Python 3.11.5 through 3.13](https://www.python.org/downloads/)
 * [pyyaml](https://pypi.org/project/PyYAML/) - install with: `pip install pyyaml`
 * [Docker](https://docs.docker.com/engine/install/) installed
 

@@ -1,12 +1,17 @@
 .PHONY: requirements requirements-extra requirements-all test lint format
 
-PYTHON_VERSION := 3.11
+# Soup Sieve 4 requires Python 3.11.5 or newer.
+PYTHON_VERSION := 3.11.5
+# uv resolves the CUDA builds from PyPI. Keep the deployable CPU lock entries.
+STRIP_CUDA := awk '/^(cuda-|nvidia-)/ { skip = 1; next } /^[^[:space:]]/ { skip = 0 } !skip'
 
 requirements:
 	uv pip compile requirements.in -o requirements.txt --universal --python-version $(PYTHON_VERSION)
+	$(STRIP_CUDA) requirements.txt > requirements.txt.tmp && mv requirements.txt.tmp requirements.txt
 
 requirements-extra:
 	uv pip compile requirements-extra.in -o requirements-extra.txt --universal --python-version $(PYTHON_VERSION)
+	$(STRIP_CUDA) requirements-extra.txt > requirements-extra.txt.tmp && mv requirements-extra.txt.tmp requirements-extra.txt
 
 requirements-all: requirements requirements-extra
 
