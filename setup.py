@@ -35,6 +35,7 @@ setup(
     packages=find_packages(),
     py_modules=["ingest"],  # Include root-level Python modules
     include_package_data=True,
+    python_requires=">=3.11.5,<3.14",
     install_requires=get_all_requirements(),
     entry_points={
         "console_scripts": [
