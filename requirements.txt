@@ -532,7 +532,7 @@ matplotlib==3.10.9
     #   unstructured-inference
 mdurl==0.1.2
     # via markdown-it-py
-mistune==3.3.3
+mistune==3.3.4
     # via
     #   -r requirements.in
     #   nbconvert
